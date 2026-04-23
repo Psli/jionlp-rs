@@ -3026,7 +3026,20 @@ fn try_bare_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     // Text must begin with month token; reject if any preceding junk.
     // Accept 1-2 digit or Chinese numeral month, followed by `月`.
     if let Some((month, rest)) = parse_month_token(text) {
-        if let Some((day, tail)) = parse_day_token(rest) {
+        // Python convention: for bare (no-year) forms, require an
+        // explicit day marker (日/号) when the day is Chinese numerals —
+        // otherwise `二月十五` is ambiguous and should fall through to
+        // lunar parsing. Allow Arabic digits without marker.
+        let rest_trimmed = rest.trim_start();
+        let day_is_arabic = rest_trimmed
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+        let has_day_marker = rest_trimmed.contains('日') || rest_trimmed.contains('号');
+        if !day_is_arabic && !has_day_marker {
+            // Let lunar (or later Gregorian with full year) handle it.
+        } else if let Some((day, tail)) = parse_day_token(rest) {
             let year = now.year();
             let (start, end) = date_range(year, Some(month), Some(day))?;
             return apply_optional_clock(start, end, tail.trim());
@@ -5254,6 +5267,15 @@ fn try_lunar_date(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
             }
         }
     }
+
+    // Gate: require a lunar marker for ambiguous forms. Regular
+    // Gregorian-shaped `M月D日/号` + arabic or simple CN numeral day
+    // goes to try_absolute_date / try_bare_month_day instead. Python's
+    // convention.
+    // No gate — Python treats Chinese-numeral-day forms as lunar when
+    // they can resolve to a valid lunar date (`二月十五` → lunar Feb 15,
+    // `五月廿二` → lunar May 22). Rely on parse_lunar_day's strictness
+    // to reject Gregorian-only shapes like `2月15日`.
 
     // Step 2: parse lunar month + optional day.
     let (lunar_month, is_leap, after_m) = parse_lunar_month(&body)?;
