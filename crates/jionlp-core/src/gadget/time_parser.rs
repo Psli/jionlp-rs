@@ -1996,6 +1996,9 @@ fn try_clock_only(text: &str, today: NaiveDate) -> Option<TimeInfo> {
         .or_else(|| text.strip_suffix("点三刻"))
         .map(|s| format!("{}点", s))
         .unwrap_or_else(|| text.to_string());
+    // Translate Chinese-numeral hours to Arabic so the span check works
+    // for `十一点半` / `十时`.
+    let normalized = cn_normalize_clock(&normalized);
     let caps = CLOCK.captures(&normalized)?;
     if caps.get(0)?.as_str().chars().count() < normalized.chars().count() - 1
         && !normalized[caps.get(0)?.end()..].trim().is_empty()
@@ -3058,10 +3061,6 @@ fn try_limit_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     let (offset, rest) = matched?;
     let rest = rest.trim_start_matches(['的', ' ']);
     let (day, tail) = parse_day_token(rest)?;
-    if !tail.trim().is_empty() {
-        return None;
-    }
-
     // Compute target year/month.
     let mut y = now.year();
     let mut m = now.month() as i32 + offset;
@@ -3074,13 +3073,9 @@ fn try_limit_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         y += 1;
     }
     let (start, end) = date_range(y, Some(m as u32), Some(day))?;
-    Some(TimeInfo {
-        time_type: "time_point",
-        start,
-        end,
-        definition: "accurate",
-        ..Default::default()
-    })
+    // Tail may be empty (bare day) or a clock expression
+    // (`下月15号下午6点`) — apply_optional_clock handles both.
+    apply_optional_clock(start, end, tail.trim())
 }
 
 /// Same as `try_bare_month_day` but uses a caller-supplied year (for
@@ -5147,6 +5142,7 @@ fn parse_lunar_month(s: &str) -> Option<(u32, bool, &str)> {
 
     const MONTHS: &[(&str, u32)] = &[
         ("正月", 1),
+        ("大年", 1), // 大年初X / 大年三十 — treat as lunar month 1.
         ("冬月", 11),
         ("腊月", 12),
         ("梅月", 1),
