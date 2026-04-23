@@ -688,6 +688,9 @@ fn try_relative_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         ("今天", 0),
         ("今日", 0),
         ("今晚", 0),
+        ("本日", 0),
+        ("当日", 0),
+        ("当天", 0),
         ("当晚", 0),
     ];
 
@@ -1351,10 +1354,13 @@ fn try_time_delta(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         ("个季度", DeltaUnit::Quarter),
         ("季度", DeltaUnit::Quarter),
         ("个小时", DeltaUnit::Hour),
+        ("个钟头", DeltaUnit::Hour),
         ("个月", DeltaUnit::Month),
         ("分钟", DeltaUnit::Minute),
+        ("刻钟", DeltaUnit::Quarter15),
         ("星期", DeltaUnit::Week),
         ("小时", DeltaUnit::Hour),
+        ("钟头", DeltaUnit::Hour),
         ("年", DeltaUnit::Year),
         ("月", DeltaUnit::Month),
         ("周", DeltaUnit::Week),
@@ -1430,6 +1436,7 @@ fn try_time_delta(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 enum DeltaUnit {
     Second,
     Minute,
+    Quarter15, // 15-minute unit (`刻钟`).
     HalfHour,
     Hour,
     Day,
@@ -1457,6 +1464,7 @@ fn apply_delta(now: NaiveDateTime, count: f64, unit: DeltaUnit) -> Option<NaiveD
     let seconds = match unit {
         DeltaUnit::Second => count,
         DeltaUnit::Minute => count * 60.0,
+        DeltaUnit::Quarter15 => count * 900.0,
         DeltaUnit::HalfHour => count * 1800.0,
         DeltaUnit::Hour => count * 3600.0,
         DeltaUnit::Day => count * 86_400.0,
@@ -4237,8 +4245,9 @@ fn try_open_ended_span(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     {
         (false, b)
     } else if let Some(b) = text.strip_suffix('前') {
-        // Bare `前` after year-boundary (`年初`, `年底` etc.) OR after a
-        // concrete `YYYY年` / `YYYY年M月` that resolves to a future point.
+        // Bare `前` after year-boundary (`年初`, `年底` etc.), month-
+        // boundary (`8月初`, `本月底`), OR after a concrete
+        // `YYYY年` / `YYYY年M月` that resolves to a future point.
         // Reject pure duration forms (`三年前` = 3 years ago).
         let last = b.chars().last()?;
         let is_boundary_suffix = matches!(last, '初' | '末' | '底' | '中' | '头' | '尾');
