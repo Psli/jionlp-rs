@@ -360,10 +360,12 @@ static YMD_CN: Lazy<Regex> = Lazy::new(|| {
 /// before 年. Group 1 captures the raw Chinese digits (to be normalized
 /// via `parse_chinese_year_digits`), groups 2..4 mirror YMD_CN.
 static YMD_CN_CHINESE: Lazy<Regex> = Lazy::new(|| {
-    // Allow 〇零一二三四五六七八九十 and 两 — the common "digit-per-char"
-    // year forms (零三 / 二零二四 / 二〇二四).
+    // Allow 〇零一二三四五六七八九十 and 两 for year digits, and accept
+    // either Arabic or Chinese numerals for month and day. The month
+    // regex allows up to 3 chars (`十一`, `十二`, `二十`), day up to
+    // 4 chars (`二十八`, `三十一`).
     Regex::new(
-        r"^([零〇一二三四五六七八九十两]+)\s*年\s*(?:(\d{1,2})\s*月\s*(?:(\d{1,2})\s*[日号])?)?\s*(.*)$",
+        r"^([零〇一二三四五六七八九十两]+)\s*年\s*(?:(\d{1,2}|[零〇一二三四五六七八九十]{1,3})\s*月\s*(?:(\d{1,2}|[零〇一二三四五六七八九十]{1,4})\s*[日号])?)?\s*(.*)$",
     )
     .unwrap()
 });
@@ -419,7 +421,10 @@ static YMD_DASH: Lazy<Regex> = Lazy::new(|| {
     // `2021-09-12-11：23`) containing `:` or `：` or a Chinese clock
     // marker (点/时/分/秒). This prevents `1999.08-2002.02` from being
     // (wrongly) absorbed as YMD + spurious trailing.
-    Regex::new(r"^(\d{4})[\-/\.](\d{1,2})[\-/\.](\d{1,2})(\s+.+|[\-\s]*\d+\s*[:：点时].*|[\-\s]*\d{2}:\d{2}.*)?$").unwrap()
+    // Accept ASCII space, -, /, . and `·` as YMD separators. Tail (group 4)
+    // must look like a clock, so `2022 11 23` parses but `2022 11 abc`
+    // doesn't accidentally succeed.
+    Regex::new(r"^(\d{4})[\-/\.\s·](\d{1,2})[\-/\.\s·](\d{1,2})(\s+.+|[\-\s]*\d+\s*[:：点时].*|[\-\s]*\d{2}:\d{2}.*)?$").unwrap()
 });
 
 /// `YYYY.MM` / `YYYY-MM` / `YYYY/MM` — year+month only (no day). Returns
@@ -443,8 +448,20 @@ fn try_absolute_date(text: &str) -> Option<TimeInfo> {
     }
     if let Some(caps) = YMD_CN_CHINESE.captures(text) {
         let year = parse_chinese_year_digits(caps.get(1)?.as_str())?;
-        let month = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-        let day = caps.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
+        let month = caps
+            .get(2)
+            .and_then(|m| {
+                let s = m.as_str();
+                s.parse::<u32>().ok().or_else(|| cn_int(s))
+            })
+            .filter(|&m| (1..=12).contains(&m));
+        let day = caps
+            .get(3)
+            .and_then(|m| {
+                let s = m.as_str();
+                s.parse::<u32>().ok().or_else(|| cn_int(s))
+            })
+            .filter(|&d| (1..=31).contains(&d));
         let tail = caps.get(4).map(|m| m.as_str().trim()).unwrap_or("");
 
         let (start, end) = date_range(year, month, day)?;
@@ -567,8 +584,10 @@ fn try_relative_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 // ───────────────────────── clock attachment ─────────────────────────────────
 
 static CLOCK: Lazy<Regex> = Lazy::new(|| {
+    // Hour, optional minute (after `点`/`时`/`:`), optional seconds — accepts
+    // both Chinese `N秒` and ISO-style `:SS` tail (e.g. `09:36:46`).
     Regex::new(
-        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|傍晚|夜里|夜间)?\s*(\d{1,2})\s*(?:[点时:](\d{1,2})?\s*(?:分)?\s*(?:(\d{1,2})\s*秒)?)?",
+        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|傍晚|夜里|夜间)?\s*(\d{1,2})\s*(?:[点时:](\d{1,2})?\s*(?:分)?\s*(?::(\d{1,2})|(\d{1,2})\s*秒)?)?",
     )
     .unwrap()
 });
@@ -664,7 +683,9 @@ fn parse_clock(s: &str) -> Option<NaiveTime> {
     let second: u32 = if implicit_min.is_some() {
         0
     } else {
+        // Group 4 = `:SS` variant, group 5 = `N秒` variant.
         caps.get(4)
+            .or_else(|| caps.get(5))
             .and_then(|m| m.as_str().parse().ok())
             .unwrap_or(0)
     };
@@ -2057,12 +2078,50 @@ fn try_limit_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 fn try_bare_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     // Text must begin with month token; reject if any preceding junk.
     // Accept 1-2 digit or Chinese numeral month, followed by `月`.
-    let (month, rest) = parse_month_token(text)?;
-    let (day, tail) = parse_day_token(rest)?;
+    if let Some((month, rest)) = parse_month_token(text) {
+        if let Some((day, tail)) = parse_day_token(rest) {
+            let year = now.year();
+            let (start, end) = date_range(year, Some(month), Some(day))?;
+            return apply_optional_clock(start, end, tail.trim());
+        }
+    }
+    // `09-01` / `9/1` / `09.01` — MM-DD with ASCII separator, no year.
+    // Optional clock tail. Must distinguish from HH:MM (4+ digits with
+    // colon), hence require the separator NOT to be `:` and require a
+    // space before the clock tail when present.
+    static MD_DASH: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(\d{1,2})[\-/\.](\d{1,2})(\s+.+|[\-\s]*\d{1,2}[:：].*)?$").unwrap()
+    });
+    if let Some(caps) = MD_DASH.captures(text) {
+        let month: u32 = caps.get(1)?.as_str().parse().ok()?;
+        let day: u32 = caps.get(2)?.as_str().parse().ok()?;
+        if (1..=12).contains(&month) && (1..=31).contains(&day) {
+            let year = now.year();
+            let (start, end) = date_range(year, Some(month), Some(day))?;
+            let tail = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            return apply_optional_clock(start, end, tail.trim());
+        }
+    }
 
-    let year = now.year();
-    let (start, end) = date_range(year, Some(month), Some(day))?;
-    apply_optional_clock(start, end, tail.trim())
+    // `6·30` / `10·1` — middle-dot month·day, no year. Python parity:
+    // see jionlp tests `'6·30'` → time_point.
+    static MD_DOT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(\d{1,2})·(\d{1,2})$").unwrap());
+    if let Some(caps) = MD_DOT.captures(text) {
+        let month: u32 = caps.get(1)?.as_str().parse().ok()?;
+        let day: u32 = caps.get(2)?.as_str().parse().ok()?;
+        if (1..=12).contains(&month) && (1..=31).contains(&day) {
+            let year = now.year();
+            let (start, end) = date_range(year, Some(month), Some(day))?;
+            return Some(TimeInfo {
+                time_type: "time_point",
+                start,
+                end,
+                definition: "accurate",
+                ..Default::default()
+            });
+        }
+    }
+    None
 }
 
 /// Python parity — `D日H时` / `D号H点` (no year, no month) — used for
