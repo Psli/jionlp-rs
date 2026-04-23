@@ -228,6 +228,11 @@ pub fn parse_time_with_ref(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if let Some(t) = try_month_week_ordinal(trimmed, now) {
         return Some(t);
     }
+    // Python parity — `<相对年>M月[D日|号][<clock>]` / `<相对年>M月份`.
+    // Covers 今年六月, 明年3月份, 去年3月3号, 前年9月2号左右, etc.
+    if let Some(t) = try_relative_year_month_day(trimmed, now) {
+        return Some(t);
+    }
     // Round 29 #48 — `明年第10周` — limit year + week.
     if let Some(t) = try_limit_year_week(trimmed, now) {
         return Some(t);
@@ -2092,6 +2097,40 @@ fn try_bare_quarter(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         definition: "accurate",
         ..Default::default()
     })
+}
+
+/// Relative-year + month (+ optional day + optional clock). Handles
+/// `今年六月`, `明年3月份`, `去年3月3号`, `前年9月2号左右`, etc.
+/// Day is optional (time_span whole month when omitted).
+fn try_relative_year_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    let (offset, rest) = limit_year_prefix(text)?;
+    let rest = rest.trim_start_matches('的');
+
+    let (month, rest) = parse_month_token(rest)?;
+    // Strip optional `份` and `的`.
+    let rest = rest.trim_start_matches('份').trim_start_matches('的');
+
+    let year = now.year() + offset;
+    if rest.is_empty() {
+        // Whole month → time_span.
+        let (start, end) = date_range(year, Some(month), None)?;
+        return Some(TimeInfo {
+            time_type: "time_span",
+            start,
+            end,
+            definition: "accurate",
+            ..Default::default()
+        });
+    }
+    // Expect day (+ optional clock + optional 左右 modifier).
+    let (day, after_day) = parse_day_token(rest)?;
+    // Strip blur modifiers Python considers noise.
+    let tail = after_day
+        .trim_start_matches('左')
+        .trim_start_matches('右')
+        .trim();
+    let (start, end) = date_range(year, Some(month), Some(day))?;
+    apply_optional_clock(start, end, tail)
 }
 
 /// `<M月>第N周` / `<Y年M月>第N周` / `<限定月>第N周` /
