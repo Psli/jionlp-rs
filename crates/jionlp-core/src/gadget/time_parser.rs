@@ -240,6 +240,11 @@ pub fn parse_time_with_ref(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if let Some(t) = try_month_week_ordinal(trimmed, now) {
         return Some(t);
     }
+    // Python parity — `下周周六` / `上周周三` / `本周星期二` — named
+    // week prefix + weekday suffix (both 周/星期/礼拜 variants).
+    if let Some(t) = try_named_week_weekday(trimmed, now) {
+        return Some(t);
+    }
     // Python parity — `<year>?上半年/下半年` / `<year>?伊始`.
     if let Some(t) = try_half_year(trimmed, now) {
         return Some(t);
@@ -2712,6 +2717,77 @@ fn try_relative_year_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInf
     apply_optional_clock(start, end, tail)
 }
 
+/// `<限定周> + <星期|周|礼拜>N` / `上个礼拜天` / `下周周六`. Resolves
+/// the named week (本/上/下/上上/下下) to that week's Monday, then
+/// offsets by the weekday number.
+fn try_named_week_weekday(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    const WK_PREF: &[(&str, i32)] = &[
+        ("本周", 0),
+        ("这周", 0),
+        ("这个周", 0),
+        ("这个礼拜", 0),
+        ("这个星期", 0),
+        ("本星期", 0),
+        ("本礼拜", 0),
+        ("上周", -1),
+        ("上个周", -1),
+        ("上一周", -1),
+        ("上个星期", -1),
+        ("上个礼拜", -1),
+        ("上礼拜", -1),
+        ("上星期", -1),
+        ("上上周", -2),
+        ("下周", 1),
+        ("下个周", 1),
+        ("下一周", 1),
+        ("下个星期", 1),
+        ("下个礼拜", 1),
+        ("下礼拜", 1),
+        ("下星期", 1),
+        ("下下周", 2),
+    ];
+    let mut best: Option<(i32, &str)> = None;
+    for (pref, off) in WK_PREF {
+        if let Some(rest) = text.strip_prefix(*pref) {
+            match best {
+                Some((_, r)) if r.len() < rest.len() => {}
+                _ => best = Some((*off, rest)),
+            }
+        }
+    }
+    let (week_offset, rest) = best?;
+    let rest = rest.trim_start_matches('的');
+    // Optional redundant leading `周/星期/礼拜`.
+    let rest = rest
+        .strip_prefix("星期")
+        .or_else(|| rest.strip_prefix("礼拜"))
+        .or_else(|| rest.strip_prefix('周'))
+        .unwrap_or(rest);
+    let weekday: u32 = match rest {
+        "一" | "1" => 1,
+        "二" | "2" => 2,
+        "三" | "3" => 3,
+        "四" | "4" => 4,
+        "五" | "5" => 5,
+        "六" | "6" => 6,
+        "日" | "天" | "7" | "日早上" | "天早上" => 7,
+        _ => return None,
+    };
+    // Find Monday of this week, offset by week_offset, add (weekday - 1).
+    let today = now.date();
+    let today_wday = today.weekday().num_days_from_monday() as i64;
+    let this_monday = today - chrono::Duration::days(today_wday);
+    let target_monday = this_monday + chrono::Duration::days((week_offset as i64) * 7);
+    let target_date = target_monday + chrono::Duration::days((weekday as i64) - 1);
+    Some(TimeInfo {
+        time_type: "time_point",
+        start: target_date.and_hms_opt(0, 0, 0)?,
+        end: target_date.and_hms_opt(23, 59, 59)?,
+        definition: "accurate",
+        ..Default::default()
+    })
+}
+
 /// `<M月>第N周` / `<Y年M月>第N周` / `<限定月>第N周` /
 /// `<相对年M月>第N周`. Mirrors Python's `self.month_week_pattern`.
 /// Week boundaries: week 1 starts on the first Monday of the month
@@ -5172,6 +5248,28 @@ fn parse_lunar_day(s: &str) -> Option<(u32, &str)> {
         }
         let end_idx = if chars.len() > 1 { chars[1].0 } else { s.len() };
         return Some((10, &s[end_idx..]));
+    }
+    // 廿一..廿九 or 廿 (= 20+N); 卅一..卅九 or 卅 (= 30+N); 念 ≡ 廿,
+    // 丗 ≡ 卅. Used for lunar day short-hand (`廿二` = 22).
+    if !chars.is_empty() && matches!(chars[0].1, '廿' | '念') {
+        if chars.len() >= 2 {
+            if let Some(u) = cn_digit_1_9(chars[1].1) {
+                let end_idx = if chars.len() > 2 { chars[2].0 } else { s.len() };
+                return Some((20 + u, &s[end_idx..]));
+            }
+        }
+        let end_idx = if chars.len() > 1 { chars[1].0 } else { s.len() };
+        return Some((20, &s[end_idx..]));
+    }
+    if !chars.is_empty() && matches!(chars[0].1, '卅' | '丗') {
+        if chars.len() >= 2 {
+            if let Some(u) = cn_digit_1_9(chars[1].1) {
+                let end_idx = if chars.len() > 2 { chars[2].0 } else { s.len() };
+                return Some((30 + u, &s[end_idx..]));
+            }
+        }
+        let end_idx = if chars.len() > 1 { chars[1].0 } else { s.len() };
+        return Some((30, &s[end_idx..]));
     }
     None
 }
