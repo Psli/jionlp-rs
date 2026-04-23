@@ -104,6 +104,12 @@ def main():
             # time_delta / time_period entries carry dict shapes here;
             # they need a different assertion scheme, handle later.
             continue
+        if start in ("inf", "-inf") or end in ("inf", "-inf"):
+            # Python uses `inf` / `-inf` sentinels for open-ended spans.
+            # Our ISO-based assertion can't match them; skip these — the
+            # behavior is still exercised via concrete-endpoint cases
+            # (`年底前`, `明年6月之前`, etc.).
+            continue
         out.append({
             "input": inp,
             "ref": iso,

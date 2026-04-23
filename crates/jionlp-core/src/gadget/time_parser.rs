@@ -979,10 +979,13 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     let a = try_absolute_date_loose(left)
         .or_else(|| try_bare_month_day(left, now))
         .or_else(|| try_limit_month_day(left, now))?;
-    // For `right`, first try as a full absolute date (loose); if that fails,
-    // try "day-only" (with optional clock) inheriting left's (year, month);
-    // also accept a bare `M月N日` that inherits left's year; or a bare month.
+    // For `right`, first try as a full absolute date (loose); then prefer
+    // `M月D日` (inheriting left's year) BEFORE "day-only" — otherwise
+    // `2017年8月11日至8月22日`'s RHS "8月22日" would mis-parse as day=8 +
+    // leftover `月22日`.
     let b = if let Some(t) = try_absolute_date_loose(right) {
+        t
+    } else if let Some(t) = try_bare_month_day_with_year(right, a.start.year(), now) {
         t
     } else if let Some((day, rest)) = parse_day_token(right) {
         let rest = rest.trim();
@@ -2489,6 +2492,18 @@ fn try_limit_month_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     })
 }
 
+/// Same as `try_bare_month_day` but uses a caller-supplied year (for
+/// try_date_range to inherit the LHS's year on the RHS).
+fn try_bare_month_day_with_year(text: &str, year: i32, _now: NaiveDateTime) -> Option<TimeInfo> {
+    if let Some((month, rest)) = parse_month_token(text) {
+        if let Some((day, tail)) = parse_day_token(rest) {
+            let (start, end) = date_range(year, Some(month), Some(day))?;
+            return apply_optional_clock(start, end, tail.trim());
+        }
+    }
+    None
+}
+
 /// Python parity — `M月D日` / `M月D日<clock>` / `M月D` (no year).
 /// Inherits year from `now`. Matches Python `year_month_day_pattern`'s
 /// middle branch (`bracket(MONTH_STRING), bracket_absence(DAY_STRING)`).
@@ -3598,7 +3613,10 @@ fn try_super_blur_hms(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 /// `X以前` where X is a concrete date/datetime (not a delta). Emits a
 /// half-infinite span by using sentinel bounds (year 9999 / year 1).
 fn try_open_ended_span(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
-    // Suffix first; longer wins.
+    // Suffix first; longer wins. Python also treats a bare `前` after
+    // a year-boundary (`年底前`, `明年底前`) as an open-ended "before"
+    // span, so accept bare `前` when the body already ends in a blur
+    // token like `底/初/末/中`.
     let (is_after, body) = if let Some(b) = text
         .strip_suffix("之后")
         .or_else(|| text.strip_suffix("以后"))
@@ -3608,6 +3626,14 @@ fn try_open_ended_span(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         .strip_suffix("之前")
         .or_else(|| text.strip_suffix("以前"))
     {
+        (false, b)
+    } else if let Some(b) = text.strip_suffix('前') {
+        // Only accept bare `前` when the preceding token is year-boundary
+        // (initial/末/底 etc.) — otherwise too ambiguous.
+        let last = b.chars().last()?;
+        if !matches!(last, '初' | '末' | '底' | '中' | '头' | '尾') {
+            return None;
+        }
         (false, b)
     } else {
         return None;
@@ -3664,18 +3690,39 @@ fn try_open_ended_span(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if !(inner.time_type == "time_point" || inner.time_type == "time_span") {
         return None;
     }
+    // Python convention: use `now` as the non-fixed endpoint when the
+    // open side is reachable from now (i.e. `X之前` with future X →
+    // [now, X]; `X之后` with past X → [X, now]). Fall back to a far
+    // sentinel only when the gap crosses all of history / future.
     let sentinel_far = NaiveDate::from_ymd_opt(9999, 12, 31)?.and_hms_opt(23, 59, 59)?;
     let sentinel_beg = NaiveDate::from_ymd_opt(1, 1, 1)?.and_hms_opt(0, 0, 0)?;
     let (start, end) = if is_after {
-        (inner.end, sentinel_far)
+        // `X之后` — from start-of-X to +inf (or to `now` if X is past).
+        if inner.end <= now {
+            (inner.end, now)
+        } else {
+            (inner.end, sentinel_far)
+        }
+    } else if inner.end >= now {
+        // `X之前` with future X → [now, end-of-X].
+        (now, inner.end)
     } else {
-        (sentinel_beg, inner.start)
+        // `X之前` with past X → [-inf, end-of-X].
+        (sentinel_beg, inner.end)
+    };
+    // Definition: `accurate` when both endpoints are known real dates
+    // (i.e. Python's case where one endpoint is `now` and the other is
+    // concrete), else `blur` (one is sentinel).
+    let defn = if start == sentinel_beg || end == sentinel_far {
+        "blur"
+    } else {
+        "accurate"
     };
     Some(TimeInfo {
         time_type: "time_span",
         start,
         end,
-        definition: "blur",
+        definition: defn,
         ..Default::default()
     })
 }
