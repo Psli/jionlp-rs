@@ -1,24 +1,30 @@
-//! Keyphrase extraction — TF-IDF scoring over character n-grams.
+//! Keyphrase extraction — TF-IDF scoring over word-level n-grams.
 //!
-//! A slim port of `jionlp/algorithm/keyphrase`: instead of depending on a
-//! Chinese word segmenter (jieba / jiojio), we score contiguous Chinese
-//! char windows (defaulting to n=2..4) and rank them with TF × IDF using
-//! `dict::idf()`.
+//! Port of `jionlp/algorithm/keyphrase`. The Python original depends on
+//! `jiojio` (a CRF-based segmenter by the same author). We use
+//! [`jieba-rs`](https://crates.io/crates/jieba-rs) instead, which is the
+//! Rust-side de-facto standard and handles OOV proper nouns (金正恩 etc.)
+//! via its HMM new-word discovery — critical for keyphrase quality on
+//! real-world news text.
 //!
-//! Heuristic rules used by the Python original that we preserve here:
-//!   * Candidates are *only* runs of Chinese characters (ASCII / digits
-//!     break sequences).
-//!   * Candidates must contain at least one non-stopword char.
-//!   * Candidates crossing punctuation boundaries are discarded.
-//!   * Ranking weight = sum of per-char IDF × term-frequency in the doc.
+//! Pipeline:
+//!   1. Split text into "runs" of Chinese characters between punctuation.
+//!   2. Run jieba on each run (HMM mode) to get word-level tokens.
+//!   3. Enumerate consecutive-token windows of 1..=MAX_TOKENS.
+//!   4. Filter: stopword boundaries, char length bounds, all-stopword.
+//!   5. Score: IDF(phrase) × TF if phrase is in our idf dict; else the
+//!      average per-token IDF (with 5.0 fallback for unseen tokens).
+//!   6. Rank, truncate to top_k.
 //!
-//! This is a Stage-1 implementation — good enough for "given a short
-//! paragraph, give me 3-5 likely keyphrases". For production-grade
-//! TextRank / embedding-based rankers, see `PLAN.md`.
+//! The TextRank variant (`extract_keyphrase_textrank`) still uses the
+//! same jieba tokenization but scores candidates with PageRank over
+//! co-occurrence edges instead of TF-IDF.
 
 use crate::dict;
 use crate::Result;
-use rustc_hash::FxHashMap;
+use jieba_rs::Jieba;
+use once_cell::sync::OnceCell;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Punctuation characters that terminate a candidate phrase.
 const PUNCTUATION: &[char] = &[
@@ -33,13 +39,19 @@ pub struct KeyPhrase {
     pub weight: f64,
 }
 
-/// Extract up to `top_k` keyphrases from `text`. n-grams from `min_n` to
-/// `max_n` characters are considered (inclusive). Scores are sum of
-/// per-char IDF × occurrence count; phrases composed of stopwords
-/// (exactly one-char run that looks like a stopword) are dropped.
+/// Shared jieba instance. `Jieba::new()` loads its ~400 KB built-in
+/// dictionary and computes the DAG — don't rebuild this per call.
+fn jieba() -> &'static Jieba {
+    static J: OnceCell<Jieba> = OnceCell::new();
+    J.get_or_init(Jieba::new)
+}
+
+/// Extract up to `top_k` keyphrases from `text`. `min_n` / `max_n` bound
+/// the candidate's **character** length (inclusive). Scores are TF × IDF
+/// with known-phrase IDF if available, else average per-token IDF.
 ///
-/// Returns phrases in descending weight order. When `text` has no valid
-/// candidates, returns an empty vec.
+/// Returns phrases in descending weight order. Empty input or `top_k == 0`
+/// yields an empty vec.
 pub fn extract_keyphrase(
     text: &str,
     top_k: usize,
@@ -54,42 +66,63 @@ pub fn extract_keyphrase(
 
     let idf = dict::idf()?;
     let stopwords = dict::stopwords()?;
+    let j = jieba();
 
-    // Split text into "Chinese-only runs" separated by punctuation and
-    // non-Hanzi. Each run is a place where candidates can live.
+    const MAX_TOKENS: usize = 5;
+
     let runs: Vec<String> = split_into_runs(text);
 
-    // Count bigram/trigram/… occurrences in each run.
     let mut freq: FxHashMap<String, u32> = FxHashMap::default();
     for run in &runs {
-        let chars: Vec<char> = run.chars().collect();
-        for n in min_n..=max_n {
-            if chars.len() < n {
-                continue;
-            }
-            for window in chars.windows(n) {
-                let phrase: String = window.iter().collect();
+        let tokens: Vec<&str> = j.cut(run, true);
+        if tokens.is_empty() {
+            continue;
+        }
+        for w in 1..=MAX_TOKENS.min(tokens.len()) {
+            for window in tokens.windows(w) {
+                // Stopword at the boundary breaks the phrase.
+                if stopwords.contains(*window.first().unwrap())
+                    || stopwords.contains(*window.last().unwrap())
+                {
+                    continue;
+                }
+                let phrase: String = window.concat();
+                let char_len = phrase.chars().count();
+                if char_len < min_n || char_len > max_n {
+                    continue;
+                }
+                if is_all_stopwords(&phrase, stopwords) {
+                    continue;
+                }
                 *freq.entry(phrase).or_insert(0) += 1;
             }
         }
     }
 
-    // Score: for each candidate phrase, compute IDF(phrase) if known,
-    // else sum per-char IDF (fallback 5.0 for rare / unknown chars).
+    // Collapse substring artifacts: if candidate X is exactly one char
+    // shorter than a longer Y (Y = X+1 chars) containing it, and both
+    // share the same TF, every occurrence of X lives inside Y — drop X.
+    let freq = collapse_substring_dupes(freq);
+
     let mut scored: Vec<KeyPhrase> = freq
         .into_iter()
-        .filter_map(|(phrase, tf)| {
-            if is_all_stopwords(&phrase, stopwords) {
-                return None;
-            }
+        .map(|(phrase, tf)| {
             let base = match idf.get(&phrase) {
                 Some(v) => *v,
-                None => phrase.chars().map(|c| char_idf(&c.to_string(), idf)).sum(),
+                None => {
+                    let toks: Vec<&str> = j.cut(&phrase, true);
+                    if toks.is_empty() {
+                        char_idf(&phrase, idf)
+                    } else {
+                        let sum: f64 = toks.iter().map(|t| char_idf(t, idf)).sum();
+                        sum / toks.len() as f64
+                    }
+                }
             };
-            Some(KeyPhrase {
+            KeyPhrase {
                 phrase,
                 weight: base * (tf as f64),
-            })
+            }
         })
         .collect();
 
@@ -105,22 +138,18 @@ pub fn extract_keyphrase(
 // ───────────────────────── TextRank variant ────────────────────────────────
 
 /// Extract keyphrases using TextRank — a PageRank-style graph ranking
-/// over character n-gram co-occurrences.
+/// over word co-occurrences (not char n-grams).
 ///
 /// ## Algorithm
 ///
 /// 1. Split text into Chinese-char runs (punctuation breaks them).
-/// 2. Generate n-gram candidates (`min_n..=max_n`) per run, filtering
-///    stopwords.
-/// 3. Build an undirected graph: each candidate is a node; two candidates
+/// 2. Tokenize each run with jieba (HMM enabled).
+/// 3. Generate word-level n-gram candidates (1..=MAX_TOKENS per run),
+///    filtering stopword boundaries and char-length bounds.
+/// 4. Build an undirected graph: each candidate is a node; two candidates
 ///    co-occurring in the same run add +1 to their edge weight.
-/// 4. Run PageRank for a small fixed number of iterations (default 20).
-/// 5. Return top-k by final score.
-///
-/// Compared to TF-IDF (`extract_keyphrase`), TextRank picks up phrases
-/// that occur with other important phrases — more "thematic" vs just
-/// "rare". For short docs the difference is small; it matters more on
-/// full articles.
+/// 5. Run PageRank for a small fixed number of iterations (default 20).
+/// 6. Return top-k by final score.
 pub fn extract_keyphrase_textrank(
     text: &str,
     top_k: usize,
@@ -133,23 +162,30 @@ pub fn extract_keyphrase_textrank(
     let min_n = min_n.max(1);
     let max_n = max_n.max(min_n);
     let stopwords = dict::stopwords()?;
+    let j = jieba();
+
+    const MAX_TOKENS: usize = 5;
 
     let runs = split_into_runs(text);
 
-    // Collect unique candidates per run, preserving within-run order for
-    // cooccurrence edges.
     let mut all_candidates: FxHashMap<String, usize> = FxHashMap::default();
     let mut run_candidates: Vec<Vec<usize>> = Vec::new();
 
     for run in &runs {
-        let chars: Vec<char> = run.chars().collect();
+        let tokens: Vec<&str> = j.cut(run, true);
         let mut cands_this_run: Vec<usize> = Vec::new();
-        for n in min_n..=max_n {
-            if chars.len() < n {
-                continue;
-            }
-            for window in chars.windows(n) {
-                let phrase: String = window.iter().collect();
+        for w in 1..=MAX_TOKENS.min(tokens.len()) {
+            for window in tokens.windows(w) {
+                if stopwords.contains(*window.first().unwrap())
+                    || stopwords.contains(*window.last().unwrap())
+                {
+                    continue;
+                }
+                let phrase: String = window.concat();
+                let char_len = phrase.chars().count();
+                if char_len < min_n || char_len > max_n {
+                    continue;
+                }
                 if is_all_stopwords(&phrase, stopwords) {
                     continue;
                 }
@@ -166,111 +202,119 @@ pub fn extract_keyphrase_textrank(
         return Ok(Vec::new());
     }
 
-    // Build sparse co-occurrence graph.
-    // `edges[i]` = Vec<(neighbor_id, weight)>; weights double-counted for
-    // undirected form (ok for normalization).
     let mut edges: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); n_nodes];
-    for run_ids in &run_candidates {
-        // All pairs within a run co-occur.
-        for i in 0..run_ids.len() {
-            for j in (i + 1)..run_ids.len() {
-                let (a, b) = (run_ids[i], run_ids[j]);
-                if a == b {
+    for cands in &run_candidates {
+        for i in 0..cands.len() {
+            for j in (i + 1)..cands.len() {
+                if cands[i] == cands[j] {
                     continue;
                 }
-                *edges[a].entry(b).or_insert(0.0) += 1.0;
-                *edges[b].entry(a).or_insert(0.0) += 1.0;
+                *edges[cands[i]].entry(cands[j]).or_insert(0.0) += 1.0;
+                *edges[cands[j]].entry(cands[i]).or_insert(0.0) += 1.0;
             }
         }
     }
 
-    // PageRank iteration. Damping factor d=0.85, 20 iters is sufficient
-    // for convergence to 3 decimals on short docs.
-    let d = 0.85;
+    let damping = 0.85;
     let iters = 20;
-    let mut score = vec![1.0_f64; n_nodes];
-    let mut next = vec![0.0_f64; n_nodes];
-
-    // Precompute out-degree weights so we don't divide by zero.
-    let out_sum: Vec<f64> = edges
-        .iter()
-        .map(|m| m.values().sum::<f64>().max(1e-12))
-        .collect();
-
+    let mut scores = vec![1.0; n_nodes];
     for _ in 0..iters {
-        for v in next.iter_mut() {
-            *v = (1.0 - d) / n_nodes as f64;
-        }
-        for (i, neighbors) in edges.iter().enumerate() {
-            if neighbors.is_empty() {
+        let mut next = vec![1.0 - damping; n_nodes];
+        for i in 0..n_nodes {
+            let total_weight: f64 = edges[i].values().sum();
+            if total_weight <= 0.0 {
                 continue;
             }
-            let contrib = d * score[i] / out_sum[i];
-            for (&j, &w) in neighbors.iter() {
-                next[j] += contrib * w;
+            for (&neighbor, &w) in &edges[i] {
+                next[neighbor] += damping * scores[i] * w / total_weight;
             }
         }
-        score.copy_from_slice(&next);
+        scores = next;
     }
 
-    // Collect results sorted descending.
-    let mut result: Vec<KeyPhrase> = all_candidates
+    let mut id_to_phrase: Vec<(String, usize)> = Vec::with_capacity(n_nodes);
+    id_to_phrase.resize(n_nodes, (String::new(), 0));
+    for (p, &id) in &all_candidates {
+        id_to_phrase[id] = (p.clone(), id);
+    }
+
+    let mut out: Vec<KeyPhrase> = id_to_phrase
         .into_iter()
         .map(|(phrase, id)| KeyPhrase {
             phrase,
-            weight: score[id],
+            weight: scores[id],
         })
         .collect();
-    result.sort_by(|a, b| {
+    out.sort_by(|a, b| {
         b.weight
             .partial_cmp(&a.weight)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    result.truncate(top_k);
-    Ok(result)
+    out.truncate(top_k);
+    Ok(out)
 }
 
+// ───────────────────────── helpers ────────────────────────────────────────
+
 fn split_into_runs(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur = String::new();
     for c in text.chars() {
         if PUNCTUATION.contains(&c) || !is_cjk(c) {
-            if !buf.is_empty() {
-                out.push(std::mem::take(&mut buf));
+            if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
             }
         } else {
-            buf.push(c);
+            cur.push(c);
         }
     }
-    if !buf.is_empty() {
-        out.push(buf);
+    if !cur.is_empty() {
+        runs.push(cur);
     }
-    out
+    runs
 }
 
 fn is_cjk(c: char) -> bool {
-    matches!(c as u32, 0x4E00..=0x9FA5)
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }
 
-fn is_all_stopwords(phrase: &str, stopwords: &rustc_hash::FxHashSet<String>) -> bool {
-    // A phrase is "stopwordy" when it equals a single-term stopword or
-    // every char is in the stopword set individually.
-    if stopwords.contains(phrase) {
-        return true;
-    }
+fn is_all_stopwords(phrase: &str, stopwords: &FxHashSet<String>) -> bool {
     phrase.chars().all(|c| stopwords.contains(&c.to_string()))
 }
 
 fn char_idf(term: &str, idf: &FxHashMap<String, f64>) -> f64 {
-    // Fallback weight for unknown terms — pick a middle-ground value so
-    // rare terms still get a reasonable score.
-    *idf.get(term).unwrap_or(&5.0)
+    if let Some(v) = idf.get(term) {
+        return *v;
+    }
+    // Fallback for unseen single chars / short terms: treat as "moderately
+    // rare". Avoid zero so the phrase isn't dragged down to 0.
+    5.0
 }
+
+/// Remove substring artifacts. Drops X when a Y of exactly (chars(X) + 1)
+/// characters contains X and has the same TF — these are the "single-char
+/// OOV tail" cases that survive into both short and long candidate windows.
+fn collapse_substring_dupes(freq: FxHashMap<String, u32>) -> FxHashMap<String, u32> {
+    let entries: Vec<(String, u32)> = freq.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut out: FxHashMap<String, u32> = FxHashMap::default();
+    for (phrase, tf) in &entries {
+        let len = phrase.chars().count();
+        let dominated = entries.iter().any(|(longer, l_tf)| {
+            let llen = longer.chars().count();
+            llen == len + 1 && l_tf == tf && longer.contains(phrase.as_str())
+        });
+        if !dominated {
+            out.insert(phrase.clone(), *tf);
+        }
+    }
+    out
+}
+
+// ───────────────────────── tests ──────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dict;
     use std::path::PathBuf;
     use std::sync::Once;
 
@@ -288,10 +332,9 @@ mod tests {
         ensure_init();
         let text = "机器学习是人工智能的一个分支,研究如何从数据中自动学习规律和模式。\
              机器学习广泛应用于自然语言处理、计算机视觉和推荐系统。";
-        let r = extract_keyphrase(text, 5, 2, 4).unwrap();
+        let r = extract_keyphrase(text, 5, 2, 10).unwrap();
         assert!(r.len() <= 5);
         assert!(!r.is_empty());
-        // "机器学习" is repeated and is a rare phrase — expect it near the top.
         assert!(
             r.iter().any(|k| k.phrase.contains("机器")),
             "expected a 机器* phrase in top 5, got: {:?}",
@@ -309,7 +352,6 @@ mod tests {
     #[test]
     fn punctuation_breaks_candidates() {
         ensure_init();
-        // No candidate should span the comma.
         let text = "苹果,香蕉";
         let r = extract_keyphrase(text, 5, 2, 2).unwrap();
         for k in &r {
@@ -343,23 +385,26 @@ mod tests {
         }
     }
 
-    // ── TextRank ─────────────────────────────────────────────────────────
-
     #[test]
     fn textrank_returns_top_k() {
         ensure_init();
-        let text = "机器学习是人工智能的一个分支。机器学习研究如何从数据中学习。机器学习应用广泛。";
+        let text = "机器学习是人工智能的一个分支,研究如何从数据中自动学习规律和模式。\
+             机器学习广泛应用于自然语言处理、计算机视觉和推荐系统。";
         let r = extract_keyphrase_textrank(text, 5, 2, 4).unwrap();
-        assert!(!r.is_empty());
         assert!(r.len() <= 5);
+        assert!(!r.is_empty());
     }
 
     #[test]
     fn textrank_sorted_descending() {
         ensure_init();
-        let r =
-            extract_keyphrase_textrank("北京是中国首都。北京有名胜古迹。北京人口多。", 10, 2, 4)
-                .unwrap();
+        let r = extract_keyphrase_textrank(
+            "北京是中国的首都。北京有很多名胜古迹。北京人口众多。",
+            10,
+            2,
+            4,
+        )
+        .unwrap();
         for w in r.windows(2) {
             assert!(w[0].weight >= w[1].weight);
         }
@@ -368,6 +413,7 @@ mod tests {
     #[test]
     fn textrank_empty_text() {
         ensure_init();
-        assert!(extract_keyphrase_textrank("", 5, 2, 4).unwrap().is_empty());
+        let r = extract_keyphrase_textrank("", 5, 2, 4).unwrap();
+        assert!(r.is_empty());
     }
 }

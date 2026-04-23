@@ -33,6 +33,7 @@ rustc-hash   = { workspace = true }
 thiserror    = { workspace = true }
 zip          = { workspace = true }
 chrono       = { workspace = true }
+jieba-rs     = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
