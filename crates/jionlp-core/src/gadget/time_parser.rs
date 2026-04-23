@@ -5015,11 +5015,24 @@ fn parse_lunar_day(s: &str) -> Option<(u32, &str)> {
             return Some((d, &s[end..]));
         }
     }
-    // 初一 .. 初十.
+    // 初一 .. 初十. Also accept `初` + Arabic digit (e.g. `初8`).
     if let Some(rest) = s.strip_prefix('初') {
         // 初十 first — longer prefix wins vs ambiguous single-char match.
         if let Some(r) = rest.strip_prefix('十') {
             return Some((10, r));
+        }
+        // Arabic digit after 初.
+        let rest_bytes = rest.as_bytes();
+        if !rest_bytes.is_empty() && rest_bytes[0].is_ascii_digit() {
+            let mut end = 0;
+            while end < rest_bytes.len() && rest_bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if let Ok(d) = rest[..end].parse::<u32>() {
+                if (1..=9).contains(&d) {
+                    return Some((d, &rest[end..]));
+                }
+            }
         }
         if let Some((n, rest2)) = next_single_cn_digit(rest) {
             if let Some(r2) = rest2 {
@@ -5171,10 +5184,41 @@ fn try_lunar_date(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         if !explicit_lunar {
             return None;
         }
-        // Whole lunar month: span from day 1 to lunar_month_length.
-        let n = lunar_month_length(year, lunar_month)?;
-        let start_date = lunar_to_solar(year, lunar_month, 1, is_leap)?;
-        let end_date = lunar_to_solar(year, lunar_month, n, is_leap)?;
+        // For `闰M月` with no explicit year, Python rolls to the closest
+        // year that actually contains that leap month (±15 years).
+        let effective_year = if is_leap && lunar_to_solar(year, lunar_month, 1, true).is_none() {
+            let mut found = None;
+            'outer: for delta in 1..=15 {
+                for sign in [-1i32, 1] {
+                    let y = year + sign * delta;
+                    if lunar_to_solar(y, lunar_month, 1, true).is_some() {
+                        found = Some(y);
+                        break 'outer;
+                    }
+                }
+            }
+            match found {
+                Some(y) => y,
+                None => return None,
+            }
+        } else {
+            year
+        };
+        // Whole lunar month: span from day 1 to the actual last day.
+        // lunar_month_length returns the *regular* month length; the leap
+        // month may be 29 or 30 days depending on the year's encoding, so
+        // we probe day 30 first and fall back to 29.
+        let n = if is_leap {
+            if lunar_to_solar(effective_year, lunar_month, 30, true).is_some() {
+                30
+            } else {
+                29
+            }
+        } else {
+            lunar_month_length(effective_year, lunar_month)?
+        };
+        let start_date = lunar_to_solar(effective_year, lunar_month, 1, is_leap)?;
+        let end_date = lunar_to_solar(effective_year, lunar_month, n, is_leap)?;
         return Some(TimeInfo {
             time_type: "time_point",
             start: start_date.and_hms_opt(0, 0, 0)?,
