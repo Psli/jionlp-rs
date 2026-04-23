@@ -115,15 +115,15 @@ fn parity_report() {
         .join("time_parity_failures.txt");
     let mut body = String::new();
     for d in &fail {
-        body.push_str(&format!(
-            "{}\t{}\t{}\n",
-            d.input, d.expected, d.got
-        ));
+        body.push_str(&format!("{}\t{}\t{}\n", d.input, d.expected, d.got));
     }
     let _ = fs::write(&dump_path, body);
 
     if !fail.is_empty() {
-        eprintln!("\n--- first 15 diffs (full list in {}) ---", dump_path.display());
+        eprintln!(
+            "\n--- first 15 diffs (full list in {}) ---",
+            dump_path.display()
+        );
         for d in fail.iter().take(15) {
             eprintln!(
                 "  in: {:?}  expected={}  got={}",

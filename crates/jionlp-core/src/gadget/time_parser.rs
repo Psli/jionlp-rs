@@ -207,12 +207,20 @@ pub fn parse_time_with_ref(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if let Some(t) = try_year_solar_season(trimmed) {
         return Some(t);
     }
+    // Python parity — `一季度` / `首季度` / `Q1季度` bare (inherits year).
+    if let Some(t) = try_bare_quarter(trimmed, now) {
+        return Some(t);
+    }
     // Round 29 #17 — school break (暑假/寒假/春假/秋假) with optional year.
     if let Some(t) = try_school_break(trimmed, now) {
         return Some(t);
     }
     // Round 17 #15 — `2021年初` / `2021年末`.
     if let Some(t) = try_year_blur_boundary(trimmed) {
+        return Some(t);
+    }
+    // Python parity — relative year + `初/末/底/中` boundary.
+    if let Some(t) = try_relative_year_blur_boundary(trimmed, now) {
         return Some(t);
     }
     // Round 29 #48 — `明年第10周` — limit year + week.
@@ -1297,10 +1305,13 @@ fn try_named_period(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         ("本", 0),
         ("这", 0),
         ("今", 0),
+        ("当", 0),
+        ("上一个", -1),
         ("上个", -1),
         ("上一", -1),
         ("上", -1),
         ("去", -1),
+        ("下一个", 1),
         ("下个", 1),
         ("下一", 1),
         ("下", 1),
@@ -1316,29 +1327,31 @@ fn try_named_period(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         }
     }
     let (offset, rest) = matched?;
-    let rest = rest.trim();
+    // Tolerate a leading `个` — covers `上一个月` matching via `上一` with
+    // rest `个月`. Also strip surrounding whitespace.
+    let rest = rest.trim_start_matches('个').trim();
 
     // Deliberately exclude 天/日 from this path — relative-day handles
     // 今天/明天/昨天 etc. This parser only covers calendar periods
     // (week/month/quarter/year). The tail after the period unit must also
     // be empty or trivial — we don't want to swallow "本月3日" as
     // "this-month" when the user meant "the 3rd of this month".
-    let (period, tail): (NamedPeriod, &str) = if rest == "周" || rest == "星期" {
-        (NamedPeriod::Week, "")
+    let (period, is_point): (NamedPeriod, bool) = if rest == "周" || rest == "星期" {
+        // Python returns time_point for 本周/上周/下周.
+        (NamedPeriod::Week, true)
     } else if rest == "月" {
-        (NamedPeriod::Month, "")
+        (NamedPeriod::Month, false)
     } else if rest == "年" {
-        (NamedPeriod::Year, "")
+        (NamedPeriod::Year, false)
     } else if rest == "季度" {
-        (NamedPeriod::Quarter, "")
+        (NamedPeriod::Quarter, false)
     } else {
         return None;
     };
-    let _ = tail;
 
     let (start, end) = period_range(period, now.date(), offset)?;
     Some(TimeInfo {
-        time_type: "time_span",
+        time_type: if is_point { "time_point" } else { "time_span" },
         start,
         end,
         definition: "accurate",
@@ -1965,14 +1978,49 @@ fn try_eight_digit_ymd(text: &str) -> Option<TimeInfo> {
     })
 }
 
-/// Pattern #11 — `YYYY年第N季度` / `YYYY年N季度` / `YYYY年Q<n>`.
+/// Pattern #11 — `YYYY年第N季度` / `YYYY年N季度` / `YYYY年Q<n>` /
+/// `YYYY年首季度` / `一季度` (bare, inherits year from `now`) /
+/// Chinese-year + quarter.
 fn try_year_solar_season(text: &str) -> Option<TimeInfo> {
-    static RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^(\d{2,4})\s*年\s*(?:第)?\s*([1-4一二三四])\s*季度$").unwrap());
-    let caps = RE.captures(text)?;
-    let year = parse_year(caps.get(1)?.as_str())?;
-    let n_str = caps.get(2)?.as_str();
-    let q: u32 = n_str.parse::<u32>().ok().or_else(|| cn_int(n_str))?;
+    // Case 1: Arabic year + quarter (+ optional 首).
+    static RE_Y: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(\d{2,4})\s*年\s*(?:第)?\s*(首|[1-4一二三四])\s*季度$").unwrap()
+    });
+    // Case 2: Chinese year + quarter.
+    static RE_CN_Y: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^([零〇一二三四五六七八九十两]+)\s*年\s*(?:第)?\s*(首|[1-4一二三四])\s*季度$")
+            .unwrap()
+    });
+    // Case 3: Bare quarter (no year).
+    static RE_BARE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^(?:第)?\s*(首|[1-4一二三四])\s*季度$").unwrap());
+    // Case 4: Q<n>季度 form.
+    static RE_Q: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(?:[Qq])([1-4])\s*季度$").unwrap());
+
+    let (year, q) = if let Some(caps) = RE_Y.captures(text) {
+        let y = parse_year(caps.get(1)?.as_str())?;
+        let n = parse_quarter_token(caps.get(2)?.as_str())?;
+        (y, n)
+    } else if let Some(caps) = RE_CN_Y.captures(text) {
+        let y = parse_chinese_year_digits(caps.get(1)?.as_str())?;
+        let n = parse_quarter_token(caps.get(2)?.as_str())?;
+        (y, n)
+    } else if let Some(caps) = RE_Q.captures(text) {
+        // Q1季度 inherits year from now — handled by try_year_solar_season
+        // being dispatched only when now is available? Not yet; for now,
+        // fall through to None and let the bare path in the parse pipeline
+        // handle it. Since this branch reaches us without `now`, we cannot
+        // resolve; return None here and let try_bare_quarter (dispatched
+        // separately) handle it.
+        let _ = caps;
+        return None;
+    } else if RE_BARE.is_match(text) {
+        // Same as above — cannot resolve without `now`.
+        return None;
+    } else {
+        return None;
+    };
+
     if !(1..=4).contains(&q) {
         return None;
     }
@@ -1994,16 +2042,143 @@ fn try_year_solar_season(text: &str) -> Option<TimeInfo> {
     })
 }
 
-/// Pattern #15 — `YYYY年初` / `YYYY年末` / `YYYY年底` / `YYYY年中`.
-fn try_year_blur_boundary(text: &str) -> Option<TimeInfo> {
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(\d{2,4})\s*年(初|末|底|中)$").unwrap());
-    let caps = RE.captures(text)?;
-    let year = parse_year(caps.get(1)?.as_str())?;
-    let pos = caps.get(2)?.as_str();
+/// Parse `首` / `一二三四` / `1..4` as a quarter number (1..=4).
+/// Python parity: Python accepts 首 as "first" (= 1).
+fn parse_quarter_token(s: &str) -> Option<u32> {
+    if s == "首" {
+        return Some(1);
+    }
+    s.parse::<u32>().ok().or_else(|| cn_int(s))
+}
+
+/// Bare quarter without year — `一季度`, `首季度`, `Q1季度` inherits
+/// year from `now`. Split from try_year_solar_season because it needs
+/// `now` whereas that function is called both with and without it.
+fn try_bare_quarter(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    static RE_BARE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^(?:第)?\s*(首|[1-4一二三四])\s*季度$").unwrap());
+    static RE_Q: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[Qq]([1-4])\s*季度$").unwrap());
+
+    let q_str = if let Some(caps) = RE_BARE.captures(text) {
+        caps.get(1)?.as_str().to_string()
+    } else if let Some(caps) = RE_Q.captures(text) {
+        caps.get(1)?.as_str().to_string()
+    } else {
+        return None;
+    };
+    let q = parse_quarter_token(&q_str)?;
+    if !(1..=4).contains(&q) {
+        return None;
+    }
+    let year = now.year();
+    let start_month = (q - 1) * 3 + 1;
+    let end_month = start_month + 2;
+    let first = NaiveDate::from_ymd_opt(year, start_month, 1)?;
+    let next = if end_month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, end_month + 1, 1)?
+    };
+    let last = next.pred_opt()?;
+    Some(TimeInfo {
+        time_type: "time_span",
+        start: first.and_hms_opt(0, 0, 0)?,
+        end: last.and_hms_opt(23, 59, 59)?,
+        definition: "accurate",
+        ..Default::default()
+    })
+}
+
+/// Relative-year + year-boundary: `明年初` / `去年底` / `今年年末` /
+/// `次年年初` / `年底` / `年初` (bare, inherits current year).
+fn try_relative_year_blur_boundary(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    const YEAR_OFFSETS: &[(&str, i32)] = &[
+        ("明年", 1),
+        ("次年", 1),
+        ("今年", 0),
+        ("本年", 0),
+        ("这年", 0),
+        ("去年", -1),
+        ("前年", -2),
+        ("大前年", -3),
+        ("后年", 2),
+        ("大后年", 3),
+    ];
+    // Find longest matching year prefix (or none → current year).
+    let (year_offset, after_year) = {
+        let mut best: Option<(i32, &str)> = None;
+        for (pref, off) in YEAR_OFFSETS {
+            if let Some(rest) = text.strip_prefix(*pref) {
+                match best {
+                    Some((_, r)) if r.len() < rest.len() => {}
+                    _ => best = Some((*off, rest)),
+                }
+            }
+        }
+        match best {
+            Some(x) => x,
+            None => (0, text),
+        }
+    };
+    // Optional leading `年` (e.g. "明年年初" = 明年 + 年初).
+    let after_year = after_year.strip_prefix('年').unwrap_or(after_year);
+    // Must match exactly a boundary token.
+    let pos = match after_year {
+        "初" | "头" => "初",
+        "末" | "底" | "尾" => "末",
+        "中" => "中",
+        _ => return None,
+    };
+    let year = now.year() + year_offset;
     let (first_month, last_month) = match pos {
-        "初" => (1u32, 2),          // Jan-Feb
-        "末" | "底" => (11u32, 12), // Nov-Dec
-        "中" => (6u32, 7),          // Jun-Jul
+        "初" => (1u32, 2),
+        "末" => (11u32, 12),
+        "中" => (6u32, 7),
+        _ => return None,
+    };
+    let first = NaiveDate::from_ymd_opt(year, first_month, 1)?;
+    let next = if last_month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, last_month + 1, 1)?
+    };
+    let last = next.pred_opt()?;
+    Some(TimeInfo {
+        time_type: "time_span",
+        start: first.and_hms_opt(0, 0, 0)?,
+        end: last.and_hms_opt(23, 59, 59)?,
+        definition: "blur",
+        ..Default::default()
+    })
+}
+
+/// Pattern #15 — `YYYY年初` / `YYYY年末` / `YYYY年底` / `YYYY年中` /
+/// Chinese-year variants, plus the bare `年底` / `年初` suffix alone
+/// (redundant prefix `年`, like `YYYY年年初`).
+fn try_year_blur_boundary(text: &str) -> Option<TimeInfo> {
+    static RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^(\d{2,4})\s*年\s*(?:年)?(初|末|底|中|头|尾)$").unwrap());
+    static RE_CN: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^([零〇一二三四五六七八九十两]+)\s*年\s*(?:年)?(初|末|底|中|头|尾)$").unwrap()
+    });
+    let (year, pos) = if let Some(caps) = RE.captures(text) {
+        (
+            parse_year(caps.get(1)?.as_str())?,
+            caps.get(2)?.as_str().to_string(),
+        )
+    } else if let Some(caps) = RE_CN.captures(text) {
+        (
+            parse_chinese_year_digits(caps.get(1)?.as_str())?,
+            caps.get(2)?.as_str().to_string(),
+        )
+    } else {
+        return None;
+    };
+    let pos = pos.as_str();
+    let (first_month, last_month) = match pos {
+        "初" | "头" => (1u32, 2),          // Jan-Feb
+        "末" | "底" | "尾" => (11u32, 12), // Nov-Dec
+        "中" => (6u32, 7),                 // Jun-Jul
         _ => return None,
     };
     let first = NaiveDate::from_ymd_opt(year, first_month, 1)?;
@@ -4457,8 +4632,10 @@ mod tests {
     #[test]
     fn named_this_week() {
         // ref_now 2024-03-15 = Fri. 本周 → Mon 03-11 .. Sun 03-17.
+        // Python classifies named weeks as time_point (referring to a
+        // specific named period); we match that convention.
         let t = parse_time_with_ref("本周", ref_now()).unwrap();
-        assert_eq!(t.time_type, "time_span");
+        assert_eq!(t.time_type, "time_point");
         assert_eq!(
             t.start.date(),
             NaiveDate::from_ymd_opt(2024, 3, 11).unwrap()
