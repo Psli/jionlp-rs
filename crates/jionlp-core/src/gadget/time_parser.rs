@@ -1055,7 +1055,10 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         .or_else(|| try_bare_month_day(left, now))
         .or_else(|| try_limit_month_day(left, now))
         .or_else(|| try_relative_year_month_day(left, now))
-        .or_else(|| try_named_period(left, now))?;
+        .or_else(|| try_named_period(left, now))
+        .or_else(|| try_relative_day(left, now))
+        .or_else(|| try_fixed_holiday(left, now))
+        .or_else(|| try_limit_year_festival(left, now))?;
     // For `right`, first try as a full absolute date (loose); then prefer
     // `M月D日` (inheriting left's year) BEFORE "day-only" — otherwise
     // `2017年8月11日至8月22日`'s RHS "8月22日" would mis-parse as day=8 +
@@ -1108,8 +1111,24 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         t
     } else if let Some(t) = try_relative_year_month_day(right, now) {
         t
+    } else if let Some(t) = try_relative_day(right, now) {
+        t
+    } else if let Some(t) = try_fixed_holiday(right, now) {
+        t
+    } else if let Some(t) = try_limit_year_festival(right, now) {
+        t
     } else {
-        return None;
+        // Festival name inherited from LHS (e.g. `去年春节到元宵节` →
+        // RHS is `元宵节` without year). Construct a pseudo-now anchored
+        // at LHS's year so year-inheriting parsers pick up the right year.
+        let lhs_now = NaiveDate::from_ymd_opt(a.start.year(), 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .unwrap_or(now);
+        if let Some(t) = try_fixed_holiday(right, lhs_now) {
+            t
+        } else {
+            return None;
+        }
     };
     // Guard: right must come after or equal left.
     if b.end < a.start {
