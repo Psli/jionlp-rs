@@ -784,10 +784,8 @@ fn try_blur_quantifier(s: &str, default_unit: &str) -> Option<MoneyInfo> {
     let remaining = remaining.trim();
     let mul = if remaining.is_empty() {
         1.0
-    } else if let Some(m) = compound_multiplier(remaining) {
-        m
     } else {
-        return None;
+        compound_multiplier(remaining)?
     };
 
     Some(MoneyInfo {

@@ -204,7 +204,7 @@ impl<'a> TokenBatchBucket<'a> {
         for batch in indexed.chunks(self.batch_size) {
             let batch_tokens: Vec<Vec<String>> = batch.iter().map(|(_, t)| t.clone()).collect();
             let batch_tags = (self.func)(batch_tokens);
-            for ((orig_idx, _), tags) in batch.iter().zip(batch_tags.into_iter()) {
+            for ((orig_idx, _), tags) in batch.iter().zip(batch_tags) {
                 ordered_out.push((*orig_idx, tags));
             }
         }

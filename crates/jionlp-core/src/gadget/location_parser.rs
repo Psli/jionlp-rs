@@ -350,7 +350,7 @@ fn filter_candidates(mut candidates: Vec<ScoredCandidate>, _text: &str) -> Vec<S
             }
         }
         for v in seen.values() {
-            if v.len() >= 2 && v.iter().any(|x| *x == 0) && v.iter().any(|x| *x == 1) {
+            if v.len() >= 2 && v.contains(&0) && v.contains(&1) {
                 // Same offset has a full-name AND an alias → reject.
                 return false;
             }

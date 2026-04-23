@@ -1423,10 +1423,9 @@ fn try_clock_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
             // qualifier. Otherwise parse the right side as-is.
             let (right_period, _) = split_period(right);
             let (left_period, _) = split_period(left);
-            let right_clock = if right_period.is_none() && left_period.is_some() {
-                parse_clock(&format!("{}{}", left_period.unwrap(), right))?
-            } else {
-                parse_clock(right)?
+            let right_clock = match (right_period, left_period) {
+                (None, Some(lp)) => parse_clock(&format!("{}{}", lp, right))?,
+                _ => parse_clock(right)?,
             };
 
             let start = base_day.and_time(left_clock);
@@ -3930,10 +3929,9 @@ fn parse_clock_range(s: &str) -> Option<(NaiveTime, NaiveTime)> {
             // Inherit left's AM/PM qualifier when right has none.
             let (rp, _) = split_period(right);
             let (lp, _) = split_period(left);
-            let rc = if rp.is_none() && lp.is_some() {
-                parse_clock(&format!("{}{}", lp.unwrap(), right))?
-            } else {
-                parse_clock(right)?
+            let rc = match (rp, lp) {
+                (None, Some(lp)) => parse_clock(&format!("{}{}", lp, right))?,
+                _ => parse_clock(right)?,
             };
             return Some((lc, rc));
         }

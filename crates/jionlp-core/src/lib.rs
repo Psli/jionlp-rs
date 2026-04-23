@@ -12,8 +12,14 @@
 // benefit. Add new allows here rather than sprinkling `#[allow]` in
 // individual modules.
 #![allow(
+    // Tolerate lints named by newer rustc/clippy releases that aren't
+    // known to the MSRV (1.75) toolchain. Needed because the allow-list
+    // below contains names like `doc_overindented_list_items` that were
+    // added in clippy 1.86.
+    unknown_lints,
     clippy::collapsible_match,
     clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
     clippy::field_reassign_with_default,
     clippy::if_same_then_else,
     clippy::manual_strip,
