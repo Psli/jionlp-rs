@@ -116,6 +116,10 @@ pub fn parse_time_with_ref(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if trimmed.is_empty() {
         return None;
     }
+    // Publish `now.year()` as the ref year so `parse_year` can correctly
+    // disambiguate 2-digit years deep in the dispatch. Restore on exit so
+    // nested calls (via try_open_ended_span etc.) see the outer context.
+    let _guard = RefYearGuard::new(now.year());
 
     // Order matters.
     //
@@ -440,19 +444,15 @@ fn parse_chinese_year_digits(s: &str) -> Option<i32> {
     if digits.is_empty() {
         return None;
     }
-    // 2-digit years follow parse_year rules; 4-digit pass straight through.
-    let n: i32 = digits.parse().ok()?;
-    Some(if digits.len() == 2 {
-        if n >= 70 {
-            1900 + n
-        } else {
-            2000 + n
-        }
+    // Route through `parse_year` so 2-digit years inherit the same
+    // ref-year-aware disambiguation (`三三年` at ref 2021 → 1933 not 2033).
+    if digits.len() == 2 {
+        parse_year(&digits)
     } else if digits.len() == 4 {
-        n
+        digits.parse().ok()
     } else {
-        return None;
-    })
+        None
+    }
 }
 
 static YMD_DASH: Lazy<Regex> = Lazy::new(|| {
@@ -552,17 +552,71 @@ fn try_absolute_date(text: &str) -> Option<TimeInfo> {
 
 /// Expand 2-digit years the same way the Python library does: 70..99 →
 /// 1900s, 00..69 → 2000s. Fully-typed 4-digit years pass through.
+/// Ref year used by `parse_year` to disambiguate 2-digit years. Set by
+/// `parse_time_with_ref` at entry so patterns deep in the dispatch can
+/// resolve `三三年` differently in 2021 vs 2099.
+std::thread_local! {
+    static REF_YEAR: std::cell::Cell<i32> = const { std::cell::Cell::new(2025) };
+}
+
+fn set_ref_year(y: i32) -> i32 {
+    REF_YEAR.with(|c| {
+        let prev = c.get();
+        c.set(y);
+        prev
+    })
+}
+
+fn current_ref_year() -> i32 {
+    REF_YEAR.with(|c| c.get())
+}
+
+/// RAII guard that restores the previous `REF_YEAR` on drop. Used at
+/// `parse_time_with_ref` entry so nested recursive parses see the
+/// outer caller's context.
+struct RefYearGuard {
+    prev: i32,
+}
+
+impl RefYearGuard {
+    fn new(y: i32) -> Self {
+        let prev = set_ref_year(y);
+        RefYearGuard { prev }
+    }
+}
+
+impl Drop for RefYearGuard {
+    fn drop(&mut self) {
+        set_ref_year(self.prev);
+    }
+}
+
+/// Expand 2-digit years using Python's `_year_completion` convention:
+///   - If the reference year starts with 19 (or older), use that century.
+///   - If the reference starts with 20, compare the 2-digit string:
+///     if `n > ref_last2 + 10`, drop to 19xx; else stay in 20xx.
+/// 4-digit years pass through unchanged.
 fn parse_year(s: &str) -> Option<i32> {
     let n: i32 = s.parse().ok()?;
-    Some(if s.len() == 2 {
-        if n >= 70 {
-            1900 + n
-        } else {
-            2000 + n
-        }
+    if s.len() != 2 {
+        return Some(n);
+    }
+    let ref_year = current_ref_year();
+    if ref_year < 1900 || ref_year >= 2100 {
+        // Fallback to static 70/00 cutoff outside the supported range.
+        return Some(if n >= 70 { 1900 + n } else { 2000 + n });
+    }
+    let ref_century_prefix = ref_year / 100; // 19 or 20
+    if ref_century_prefix == 19 {
+        return Some(1900 + n);
+    }
+    // ref is 20xx
+    let ref_last2 = ref_year % 100;
+    if n > ref_last2 + 10 {
+        Some(1900 + n)
     } else {
-        n
-    })
+        Some(2000 + n)
+    }
 }
 
 /// Produce the [start, end] range for a given date granularity.
