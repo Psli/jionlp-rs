@@ -732,6 +732,13 @@ fn extract_summary(text: String, top_k: u32) -> NifResult<Vec<NifSummarySentence
 }
 
 #[rustler::nif]
+fn extract_summary_by_length(text: String, max_chars: u32) -> NifResult<Vec<NifSummarySentence>> {
+    core::extract_summary_by_length(&text, max_chars as usize)
+        .map(|v| v.into_iter().map(Into::into).collect())
+        .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
+}
+
+#[rustler::nif]
 fn swap_char_position(
     text: String,
     n: u32,

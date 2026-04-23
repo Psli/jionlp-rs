@@ -41,6 +41,7 @@ static PINYIN_PHRASE: OnceCell<FxHashMap<String, Vec<String>>> = OnceCell::new()
 static IDF: OnceCell<FxHashMap<String, f64>> = OnceCell::new();
 static SENTIMENT_WORDS: OnceCell<FxHashMap<String, f64>> = OnceCell::new();
 static SENTIMENT_EXPAND_WORDS: OnceCell<FxHashMap<String, f64>> = OnceCell::new();
+static TOPIC_PROMINENCE: OnceCell<Option<TopicProminence>> = OnceCell::new();
 
 /// Admin code → (province, city, county) mapping extracted from
 /// `china_location.zip`. Codes are the 6-digit strings at each of the top
@@ -101,6 +102,21 @@ pub struct PhoneLocationDict {
     pub zip_code: FxHashMap<String, String>,
     /// Landline area code (3-4 digit) → "province city".
     pub area_code: FxHashMap<String, String>,
+}
+
+/// LDA topic-prominence data derived from `topic_word_weight.json`. Used by
+/// `extract_keyphrase` / `extract_summary` to weight candidates by
+/// "topic-specificness" (high = this word is concentrated in few topics and
+/// therefore signals a specific subject; low = generic / spread across all
+/// topics).
+///
+/// `per_word` is a min-max-normalized [0.0, 1.0] score per token. `unk` is
+/// the fallback for tokens not in the LDA vocabulary (≈ mean / 2, matching
+/// Python's `unk_topic_prominence_value`).
+#[derive(Debug)]
+pub struct TopicProminence {
+    pub per_word: FxHashMap<String, f64>,
+    pub unk: f64,
 }
 
 /// Initialize the global dictionary root. Idempotent — second call is a no-op.
@@ -813,6 +829,105 @@ pub fn idf() -> Result<&'static FxHashMap<String, f64>> {
         }
         Ok(map)
     })
+}
+
+/// Load the LDA topic-prominence table. Computed once from
+/// `topic_word_weight.json`, which is **not bundled in the crates.io
+/// tarball** (too large — see the note in `Cargo.toml`'s `include` field).
+///
+/// Returns `Ok(None)` when the file is missing — this is expected for Rust
+/// consumers who installed from crates.io without fetching the full
+/// `jionlp-data-v*.tar.gz`. Callers (summary / keyphrase) use this to
+/// decide whether to apply the topic-weight multiplier.
+///
+/// Algorithm (matches Python `extract_summary._topic_prominence`):
+///   1. For each word w: compute KL(P(topic|w) ‖ uniform) as
+///      `sum_i p_i * log2(p_i * N)`, where `p_i = P(topic=i | w)` (fallback
+///      `1e-5` for topics the word doesn't appear in) and N is the topic
+///      count.
+///   2. Min-max normalize across all words to [0, 1].
+///   3. `unk = mean / 2` — fallback for OOV words.
+pub fn topic_prominence() -> Result<Option<&'static TopicProminence>> {
+    let cell = TOPIC_PROMINENCE.get_or_try_init(|| -> Result<Option<TopicProminence>> {
+        let root = dict_root()?;
+        let path = root.join("topic_word_weight.zip");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = read_zip_entry("topic_word_weight.zip", "topic_word_weight.json")?;
+        let raw: FxHashMap<String, FxHashMap<String, f64>> =
+            serde_json::from_str(&text).map_err(|e| Error::DictIo {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("json: {}", e),
+                ),
+            })?;
+
+        // Topic count = 1 + max topic id across all entries. LDA files
+        // store topics as stringified ints ("0".."N-1").
+        let mut max_topic: usize = 0;
+        for inner in raw.values() {
+            for k in inner.keys() {
+                if let Ok(tid) = k.parse::<usize>() {
+                    if tid > max_topic {
+                        max_topic = tid;
+                    }
+                }
+            }
+        }
+        let num_topics = max_topic + 1;
+        if num_topics == 0 || raw.is_empty() {
+            return Ok(Some(TopicProminence {
+                per_word: FxHashMap::default(),
+                unk: 0.0,
+            }));
+        }
+
+        let mut kl_by_word: FxHashMap<String, f64> = FxHashMap::default();
+        kl_by_word.reserve(raw.len());
+        let n_f = num_topics as f64;
+        for (word, topics) in &raw {
+            let mut kl = 0.0_f64;
+            for i in 0..num_topics {
+                let p = topics.get(&i.to_string()).copied().unwrap_or(1e-5);
+                if p > 0.0 {
+                    kl += p * (p * n_f).log2();
+                }
+            }
+            kl_by_word.insert(word.clone(), kl);
+        }
+
+        // Min-max normalize to [0, 1].
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in kl_by_word.values() {
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+        }
+        let span = hi - lo;
+        if span > 0.0 {
+            for v in kl_by_word.values_mut() {
+                *v = (*v - lo) / span;
+            }
+        }
+
+        let sum: f64 = kl_by_word.values().sum();
+        let unk = if kl_by_word.is_empty() {
+            0.0
+        } else {
+            sum / (2.0 * kl_by_word.len() as f64)
+        };
+
+        Ok(Some(TopicProminence {
+            per_word: kl_by_word,
+            unk,
+        }))
+    })?;
+    Ok(cell.as_ref())
 }
 
 /// Load the per-character dictionary from `chinese_char_dictionary.zip`.

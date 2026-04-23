@@ -15,10 +15,28 @@ rust-version.workspace = true
 # box. The bundled set is ~9 MB (mostly compressed zip archives) in
 # `data/`, following the common Rust convention (cf. `tantivy`,
 # `whatlang`, `icu`).
+#
+# LDA topic model data (`topic_word_weight.zip`, 1.8 MB) is intentionally
+# excluded from the crate tarball to keep it under crates.io's 10 MB
+# hard limit. Consumers who want LDA-weighted summary / keyphrase scoring
+# should fetch the full `jionlp-data-v*.tar.gz` from GitHub Releases and
+# point `init_from_path()` at that directory — see `dict::init_default`
+# behavior when the file is missing (gracefully falls back to non-LDA
+# scoring).
 include = [
     "src/**/*.rs",
     "data/**/*.txt",
-    "data/**/*.zip",
+    "data/china_location.zip",
+    "data/china_location_change.txt",
+    "data/chinese_char_dictionary.zip",
+    "data/chinese_idiom.zip",
+    "data/chinese_word_dictionary.zip",
+    "data/idf.zip",
+    "data/phone_location.zip",
+    "data/pinyin_phrase.zip",
+    "data/pornography.zip",
+    "data/sentiment_words.zip",
+    "data/xiehouyu.zip",
     "Cargo.toml",
     "README.md",
     "LICENSE*",
@@ -34,6 +52,5 @@ thiserror    = { workspace = true }
 zip          = { workspace = true }
 chrono       = { workspace = true }
 jieba-rs     = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
+# Used to parse LDA topic_word_weight.json at dict init time.
+serde_json   = { workspace = true }

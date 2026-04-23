@@ -1,32 +1,41 @@
-//! Extractive text summarization — rank sentences by n-gram TF-IDF with
-//! lead-3 and length weighting.
-//!
-//! Follows `jionlp/algorithm/summary/extract_summary.py` with one
-//! deliberate omission: the Python version adds an LDA topic weight,
-//! which requires shipping ~31 MB of pre-trained `topic_word_weight` /
-//! `word_topic_weight` matrices. Those were dropped from this port's
-//! data bundle (9 MB vs Python's 67 MB), so we approximate with the
-//! remaining three factors — empirically this captures most of the
-//! ranking signal on news text.
+//! Extractive text summarization — rank sentences by the same weighted
+//! combination that Python's `extract_summary` uses.
 //!
 //! Weighting pipeline (per sentence):
-//!   1. **Base**: mean of per-bigram IDF over CJK bigrams present in
-//!      `dict::idf()`.
-//!   2. **Length penalty**: if `char_len < 15` or `char_len > 70`,
-//!      weight ×= 0.7.  (Matches Python's `len(sen) < 15 or len(sen) > 70`.)
-//!   3. **Lead-3 bonus**: if `position < 3`, weight ×= 1.2. (Matches
-//!      Python's `lead_3_weight`.)
-//!   4. **Zero-score filter**: drop sentences whose base score is 0
+//!   1. **Base TF-IDF**: mean of per-bigram IDF over CJK bigrams present
+//!      in `dict::idf()`.
+//!   2. **LDA topic weight**: mean of `topic_prominence[word]` for
+//!      jieba-tokenized words in the sentence. Multiplied by
+//!      `topic_theta` (= 0.5, matching Python default) and added to the
+//!      TF-IDF score. Silently skipped when `topic_word_weight.zip` is
+//!      not present (crates.io consumers without the full data tarball).
+//!   3. **Length penalty**: if `CJK char_len < 15` or `> 70`, ×= 0.7.
+//!      (Matches Python's `len(sen) < 15 or len(sen) > 70`.)
+//!   4. **Lead-3 bonus**: if `position < 3`, ×= 1.2. (Matches Python's
+//!      `lead_3_weight`.)
+//!   5. **Zero-score filter**: drop sentences whose base score is 0
 //!      (pure-ASCII fragments like "..." that the splitter produces).
 //!
-//! For MMR diversity, call `extract_summary_mmr` explicitly —
-//! Python applies it automatically; we keep it an opt-in function to
-//! preserve the simpler TF-IDF path as a callable primitive.
+//! For MMR diversity, call `extract_summary_mmr` explicitly — Python
+//! applies it automatically; we keep it opt-in to preserve the simpler
+//! TF-IDF + topic path as a callable primitive.
 
 use crate::dict;
+use crate::dict::TopicProminence;
 use crate::gadget::split_sentence::{split_sentence, Criterion as SplitCriterion};
 use crate::Result;
+use jieba_rs::Jieba;
+use once_cell::sync::OnceCell;
 use rustc_hash::FxHashMap;
+
+/// Matches Python's `topic_theta` default. Controls how strongly LDA
+/// topic-prominence contributes vs TF-IDF.
+const TOPIC_THETA: f64 = 0.5;
+
+fn jieba() -> &'static Jieba {
+    static J: OnceCell<Jieba> = OnceCell::new();
+    J.get_or_init(Jieba::new)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummarySentence {
@@ -42,22 +51,23 @@ pub fn extract_summary(text: &str, top_k: usize) -> Result<Vec<SummarySentence>>
         return Ok(Vec::new());
     }
     let idf = dict::idf()?;
+    let topic = dict::topic_prominence()?;
 
     let sentences = split_sentence(text, SplitCriterion::Coarse);
     if sentences.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Score each sentence: mean of per-bigram IDF, then length penalty
-    // (<15 or >70 CJK chars → ×0.7) and lead-3 position bonus (first
-    // three sentences → ×1.2). Zero-score sentences (pure-ASCII like
-    // "...") are dropped — the splitter produces them but they carry
-    // no summary content.
+    // Score each sentence with TF-IDF + (optional) LDA topic + length
+    // penalty + lead-3 bonus. Zero-score sentences (pure-ASCII like "...")
+    // are dropped — the splitter produces them but they carry no summary
+    // content.
     let scored: Vec<SummarySentence> = sentences
         .into_iter()
         .enumerate()
         .map(|(pos, s)| {
-            let base = bigram_idf_score(&s, idf);
+            let tfidf = bigram_idf_score(&s, idf);
+            let topic_w = topic.map(|t| sentence_topic_weight(&s, t)).unwrap_or(0.0);
             let cjk_len = s.chars().filter(|c| is_cjk(*c)).count();
             let length_mul = if !(15..=70).contains(&cjk_len) {
                 0.7
@@ -65,9 +75,10 @@ pub fn extract_summary(text: &str, top_k: usize) -> Result<Vec<SummarySentence>>
                 1.0
             };
             let lead_mul = if pos < 3 { 1.2 } else { 1.0 };
+            let score = (tfidf + TOPIC_THETA * topic_w) * length_mul * lead_mul;
             SummarySentence {
                 text: s,
-                score: base * length_mul * lead_mul,
+                score,
                 position: pos,
             }
         })
@@ -86,6 +97,46 @@ pub fn extract_summary(text: &str, top_k: usize) -> Result<Vec<SummarySentence>>
     by_score.sort_by_key(|s| s.position);
 
     Ok(by_score)
+}
+
+/// Extract as many high-scoring sentences as fit in a character budget.
+///
+/// Mirrors Python's `extract_summary(text, summary_length=200)`: picks
+/// sentences in descending score order (same weighting as
+/// `extract_summary`) and keeps accepting them until the cumulative
+/// character count would exceed `max_chars`. Selected sentences are
+/// returned in original document order.
+///
+/// The cap is "soft" in the same sense as Python's: if the highest-ranked
+/// sentence alone exceeds the budget, it is still returned (otherwise an
+/// empty summary would be surprising).
+pub fn extract_summary_by_length(text: &str, max_chars: usize) -> Result<Vec<SummarySentence>> {
+    if text.is_empty() || max_chars == 0 {
+        return Ok(Vec::new());
+    }
+    // Reuse the top-k path with a large k, then greedy-fit by char budget.
+    let ranked = extract_summary(text, usize::MAX)?;
+    let mut by_score = ranked;
+    by_score.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut picked: Vec<SummarySentence> = Vec::new();
+    let mut total = 0usize;
+    for s in by_score {
+        let len = s.text.chars().count();
+        if picked.is_empty() || total + len <= max_chars {
+            total += len;
+            picked.push(s);
+        } else if total + len > max_chars {
+            // Stop at first overflow — matches Python `break` behaviour.
+            break;
+        }
+    }
+    picked.sort_by_key(|s| s.position);
+    Ok(picked)
 }
 
 /// Extract summary with Maximal Marginal Relevance (MMR) diversity.
@@ -115,15 +166,17 @@ pub fn extract_summary_mmr(text: &str, top_k: usize, lambda: f64) -> Result<Vec<
     }
 
     // Precompute score and bigram set for each sentence. Apply the same
-    // length penalty + lead-3 bonus as `extract_summary`, so lambda=1.0
-    // degenerates exactly to the basic top-k path.
+    // TF-IDF + LDA topic + length penalty + lead-3 as `extract_summary`,
+    // so lambda=1.0 degenerates exactly to the basic top-k path.
+    let topic = dict::topic_prominence()?;
     let bigrams: Vec<rustc_hash::FxHashSet<String>> =
         sentences.iter().map(|s| bigrams_of(s)).collect();
     let scores: Vec<f64> = sentences
         .iter()
         .enumerate()
         .map(|(pos, s)| {
-            let base = bigram_idf_score(s, idf);
+            let tfidf = bigram_idf_score(s, idf);
+            let topic_w = topic.map(|t| sentence_topic_weight(s, t)).unwrap_or(0.0);
             let cjk_len = s.chars().filter(|c| is_cjk(*c)).count();
             let length_mul = if !(15..=70).contains(&cjk_len) {
                 0.7
@@ -131,7 +184,7 @@ pub fn extract_summary_mmr(text: &str, top_k: usize, lambda: f64) -> Result<Vec<
                 1.0
             };
             let lead_mul = if pos < 3 { 1.2 } else { 1.0 };
-            base * length_mul * lead_mul
+            (tfidf + TOPIC_THETA * topic_w) * length_mul * lead_mul
         })
         .collect();
 
@@ -171,6 +224,20 @@ pub fn extract_summary_mmr(text: &str, top_k: usize, lambda: f64) -> Result<Vec<
         })
         .collect();
     Ok(out)
+}
+
+/// Mean topic-prominence over the jieba-tokenized words in a sentence.
+/// OOV words use `TopicProminence::unk`. Returns 0 for empty input.
+fn sentence_topic_weight(sentence: &str, topic: &TopicProminence) -> f64 {
+    let tokens = jieba().cut(sentence, true);
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = tokens
+        .iter()
+        .map(|t| topic.per_word.get(*t).copied().unwrap_or(topic.unk))
+        .sum();
+    sum / tokens.len() as f64
 }
 
 fn bigrams_of(s: &str) -> rustc_hash::FxHashSet<String> {

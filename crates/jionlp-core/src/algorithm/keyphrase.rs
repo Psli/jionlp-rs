@@ -66,9 +66,14 @@ pub fn extract_keyphrase(
 
     let idf = dict::idf()?;
     let stopwords = dict::stopwords()?;
+    let topic = dict::topic_prominence()?;
     let j = jieba();
 
     const MAX_TOKENS: usize = 5;
+    // Matches Python's default `topic_theta=0.5` in
+    // ChineseKeyPhrasesExtractor — the multiplier on the LDA
+    // topic-prominence term added to the TF-IDF score.
+    const TOPIC_THETA: f64 = 0.5;
 
     let runs: Vec<String> = split_into_runs(text);
 
@@ -107,10 +112,10 @@ pub fn extract_keyphrase(
     let mut scored: Vec<KeyPhrase> = freq
         .into_iter()
         .map(|(phrase, tf)| {
+            let toks: Vec<&str> = j.cut(&phrase, true);
             let base = match idf.get(&phrase) {
                 Some(v) => *v,
                 None => {
-                    let toks: Vec<&str> = j.cut(&phrase, true);
                     if toks.is_empty() {
                         char_idf(&phrase, idf)
                     } else {
@@ -119,9 +124,22 @@ pub fn extract_keyphrase(
                     }
                 }
             };
+            // LDA topic weight: mean of per-word topic-prominence. Silent
+            // no-op when the LDA data isn't bundled (Rust users on the
+            // crates.io subset).
+            let topic_w = match topic {
+                Some(t) if !toks.is_empty() => {
+                    let sum: f64 = toks
+                        .iter()
+                        .map(|w| t.per_word.get(*w).copied().unwrap_or(t.unk))
+                        .sum();
+                    sum / toks.len() as f64
+                }
+                _ => 0.0,
+            };
             KeyPhrase {
                 phrase,
-                weight: base * (tf as f64),
+                weight: (base + TOPIC_THETA * topic_w) * (tf as f64),
             }
         })
         .collect();

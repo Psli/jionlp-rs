@@ -64,7 +64,9 @@ pub use algorithm::ner_tools::{
 pub use algorithm::new_word::new_word_discovery;
 pub use algorithm::sentiment::sentiment_score;
 pub use algorithm::simhash::{hamming_distance, simhash, simhash_ngram, simhash_similarity};
-pub use algorithm::summary::{extract_summary, extract_summary_mmr, SummarySentence};
+pub use algorithm::summary::{
+    extract_summary, extract_summary_by_length, extract_summary_mmr, SummarySentence,
+};
 pub use algorithm::tag_conversion::{cws, ner as ner_convert, pos, Entity, F1};
 pub use algorithm::text_classification::{
     analyse_dataset as classification_analyse_dataset, analyse_freq_words, DatasetAnalysis,
