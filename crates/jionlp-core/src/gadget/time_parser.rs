@@ -5026,8 +5026,15 @@ fn try_solar_term(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 
     for &(name, _, _, _, _) in SOLAR_TERMS {
         if rest == name {
-            let (m, d) = solar_term_date(name, year)?;
-            let (start, end) = date_range(year, Some(m), Some(d))?;
+            // 小寒/大寒 fall in January of the *next* solar year after
+            // the declared Chinese year ("2017年大寒" → 2018-01-20).
+            let effective_year = if matches!(name, "小寒" | "大寒") {
+                year + 1
+            } else {
+                year
+            };
+            let (m, d) = solar_term_date(name, effective_year)?;
+            let (start, end) = date_range(effective_year, Some(m), Some(d))?;
             return Some(TimeInfo {
                 time_type: "time_point",
                 start,
