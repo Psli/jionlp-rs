@@ -753,6 +753,17 @@ fn apply_optional_clock(start: NaiveDateTime, end: NaiveDateTime, tail: &str) ->
             ..Default::default()
         });
     }
+    // Bare period-of-day (`早上` / `下午` / `晚上` / ...) — coarse window.
+    if let Some((pstart, pend)) = bare_period_window(tail) {
+        let day = start.date();
+        return Some(TimeInfo {
+            time_type: "time_point",
+            start: day.and_hms_opt(pstart, 0, 0)?,
+            end: day.and_hms_opt(pend, 59, 59)?,
+            definition: "accurate",
+            ..Default::default()
+        });
+    }
 
     // Tolerate a leading dash/slash before the clock (e.g.
     // `2021-09-12-11：23` — tail `-11：23`). Also strip fullwidth colon
@@ -778,6 +789,23 @@ fn apply_optional_clock(start: NaiveDateTime, end: NaiveDateTime, tail: &str) ->
         definition: "accurate",
         ..Default::default()
     })
+}
+
+/// Period-of-day coarse time window (hour-start, hour-end inclusive).
+fn bare_period_window(tail: &str) -> Option<(u32, u32)> {
+    // Match longest-first for `早上` vs `早`.
+    let t = tail.trim();
+    match t {
+        "早上" | "早晨" | "早" => Some((6, 9)),
+        "上午" => Some((7, 11)),
+        "中午" => Some((12, 12)),
+        "下午" | "午后" => Some((13, 17)),
+        "傍晚" => Some((17, 18)),
+        "晚上" | "晚" => Some((18, 23)),
+        "夜里" | "夜间" | "半夜" => Some((0, 5)),
+        "凌晨" => Some((0, 5)),
+        _ => None,
+    }
 }
 
 /// Replace leading Chinese numerals before `点/时` and between `点/时`
@@ -3566,20 +3594,15 @@ fn try_special_phrases(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 /// (current day if matches, else next).
 fn try_standalone_weekday(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     let (weekday, rest) = match_weekday(text)?;
-    if !rest.is_empty() {
-        return None;
-    }
     let today = now.date();
     let cur = today.weekday().num_days_from_monday();
     let delta = (weekday + 7 - cur) % 7;
     let target = today + Duration::days(delta as i64);
-    Some(TimeInfo {
-        time_type: "time_point",
-        start: target.and_hms_opt(0, 0, 0)?,
-        end: target.and_hms_opt(23, 59, 59)?,
-        definition: "accurate",
-        ..Default::default()
-    })
+    let start = target.and_hms_opt(0, 0, 0)?;
+    let end = target.and_hms_opt(23, 59, 59)?;
+    // Accept a trailing period-of-day (`早上` / `下午` / `晚上` / `中午`
+    // / `凌晨` / `傍晚`) or a full clock expression.
+    apply_optional_clock(start, end, rest.trim())
 }
 
 /// Pattern #41 — `本周一` / `上周五` / `下周三`.
