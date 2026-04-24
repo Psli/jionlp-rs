@@ -1416,11 +1416,21 @@ fn try_time_delta(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 
     let mut num_body: Option<&str> = None;
     let mut matched_unit: Option<DeltaUnit> = None;
-    for (suffix, unit) in UNITS {
-        if let Some(rest) = body.strip_suffix(suffix) {
-            num_body = Some(rest);
-            matched_unit = Some(*unit);
-            break;
+    let mut plus_half: bool = false;
+    // Try `body` then `body - 半` so `3年半` matches as count=3 unit=year
+    // with plus_half=true.
+    let try_bodies: [&str; 2] = [body, body.strip_suffix('半').unwrap_or("")];
+    'outer: for (i, try_body) in try_bodies.iter().enumerate() {
+        if try_body.is_empty() {
+            continue;
+        }
+        for (suffix, unit) in UNITS {
+            if let Some(rest) = try_body.strip_suffix(suffix) {
+                num_body = Some(rest);
+                matched_unit = Some(*unit);
+                plus_half = i == 1;
+                break 'outer;
+            }
         }
     }
     let num_body = num_body?.trim_end_matches('个').trim();
@@ -1429,11 +1439,12 @@ fn try_time_delta(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     // HalfHour already represents "half of an hour" — the implicit count
     // is 1. The seconds calculation in apply_delta handles the 1800-second
     // base.
-    let count: f64 = if matches!(unit, DeltaUnit::HalfHour) {
+    let base_count: f64 = if matches!(unit, DeltaUnit::HalfHour) {
         1.0
     } else {
         parse_count(num_body)?
     };
+    let count = base_count + if plus_half { 0.5 } else { 0.0 };
 
     let result = apply_delta(now, count * direction as f64, unit)?;
     // Year-unit bare `前/后` → time_span covering the target year (Python
