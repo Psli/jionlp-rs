@@ -747,8 +747,9 @@ fn try_relative_day(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
 static CLOCK: Lazy<Regex> = Lazy::new(|| {
     // Hour, optional minute (after `点`/`时`/`:`), optional seconds — accepts
     // both Chinese `N秒` and ISO-style `:SS` tail (e.g. `09:36:46`).
+    // Accepts optional 钟 suffix after 点/时 (`11点钟` ≡ `11点`).
     Regex::new(
-        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|晚|傍晚|夜里|夜间|半夜)?\s*(\d{1,2})\s*(?:[点时:](\d{1,2})?\s*(?:分)?\s*(?::(\d{1,2})|(\d{1,2})\s*秒)?)?",
+        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|晚|傍晚|夜里|夜间|半夜)?\s*(\d{1,2})\s*(?:[点时:](?:钟)?(\d{1,2})?\s*(?:分)?\s*(?::(\d{1,2})|(\d{1,2})\s*秒)?)?",
     )
     .unwrap()
 });
