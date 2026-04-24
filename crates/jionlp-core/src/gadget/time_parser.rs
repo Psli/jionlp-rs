@@ -282,6 +282,11 @@ pub fn parse_time_with_ref(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     if let Some(t) = try_span_to_now(trimmed, now) {
         return Some(t);
     }
+    // Python parity — `<year>年<m1>[月]-<m2>月[份]` / `<year>年<m1月>D1-D2日`:
+    // year-scoped month or day range.
+    if let Some(t) = try_year_month_or_day_range(trimmed, now) {
+        return Some(t);
+    }
     // Python parity — concrete date/time + 左右 / 前后 / 附近 suffix.
     // Strip the approx modifier, reparse, flag definition as `blur`.
     if let Some(t) = try_approx_modifier(trimmed, now) {
@@ -2621,6 +2626,67 @@ fn try_approx_modifier(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
                 });
             }
         }
+    }
+    None
+}
+
+/// `<year>年<m1>[月]-<m2>月[份]` or `<year>年<m>月<d1>-<d2>日`.
+/// Handles compact year-scoped ranges that YMD_DASH doesn't match because
+/// the year prefix uses `年` rather than a dash/slash separator.
+fn try_year_month_or_day_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    let _ = now;
+    // `YYYY年<m1>[月]-<m2>月[份]` — month range within a year.
+    static RE_MR: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"^(\d{2,4})\s*年\s*(\d{1,2}|[零〇一二三四五六七八九十]{1,3})\s*月?\s*[\-—–～~－]{1,3}\s*(\d{1,2}|[零〇一二三四五六七八九十]{1,3})\s*月\s*(?:份)?$",
+        )
+        .unwrap()
+    });
+    if let Some(caps) = RE_MR.captures(text) {
+        let year = parse_year(caps.get(1)?.as_str())?;
+        let m1s = caps.get(2)?.as_str();
+        let m2s = caps.get(3)?.as_str();
+        let m1: u32 = m1s.parse::<u32>().ok().or_else(|| cn_int(m1s))?;
+        let m2: u32 = m2s.parse::<u32>().ok().or_else(|| cn_int(m2s))?;
+        if !(1..=12).contains(&m1) || !(1..=12).contains(&m2) || m2 < m1 {
+            return None;
+        }
+        let (start, _) = date_range(year, Some(m1), None)?;
+        let (_, end) = date_range(year, Some(m2), None)?;
+        return Some(TimeInfo {
+            time_type: "time_span",
+            start,
+            end,
+            definition: "accurate",
+            ..Default::default()
+        });
+    }
+    // `YYYY年M月D1-D2日` — day range within a year-month.
+    static RE_DR: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[\-—–]\s*(\d{1,2})\s*日$")
+            .unwrap()
+    });
+    if let Some(caps) = RE_DR.captures(text) {
+        let year = parse_year(caps.get(1)?.as_str())?;
+        let month: u32 = caps.get(2)?.as_str().parse().ok()?;
+        let d1: u32 = caps.get(3)?.as_str().parse().ok()?;
+        let d2: u32 = caps.get(4)?.as_str().parse().ok()?;
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&d1)
+            || !(1..=31).contains(&d2)
+            || d2 < d1
+        {
+            return None;
+        }
+        let (start, _) = date_range(year, Some(month), Some(d1))?;
+        let (_, end) = date_range(year, Some(month), Some(d2))?;
+        return Some(TimeInfo {
+            time_type: "time_span",
+            start,
+            end,
+            definition: "accurate",
+            ..Default::default()
+        });
     }
     None
 }
