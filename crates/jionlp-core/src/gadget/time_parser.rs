@@ -1349,7 +1349,9 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     //   - Otherwise (midnight start or time_span): use b.end.
     let end = if b.time_type == "time_point" && b.start.time() != chrono::NaiveTime::MIN {
         let gap = (b.end - b.start).num_seconds();
-        if gap >= 3000 {
+        // Exactly 59m59s = hour-precision (e.g. `16时`) → anchor to start.
+        // Anything else (minute precision or period window) → use b.end.
+        if gap == 3599 {
             b.start
         } else {
             b.end
