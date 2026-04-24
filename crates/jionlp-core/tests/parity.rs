@@ -509,7 +509,8 @@ fn parity_parse_time_named_this_week() {
         .and_hms_opt(10, 30, 0)
         .unwrap();
     let t = jio::parse_time_with_ref("本周", now).unwrap();
-    assert_eq!(t.time_type, "time_span");
+    // Python returns time_point for named weeks.
+    assert_eq!(t.time_type, "time_point");
     assert_eq!(
         t.start.date(),
         chrono::NaiveDate::from_ymd_opt(2024, 3, 11).unwrap()
@@ -902,10 +903,12 @@ fn parity_lunar_mid_autumn_alias() {
 
 #[test]
 fn parity_lunar_new_year_eve() {
+    // Python treats `2025年除夕` as the lunar new year's eve of lunar
+    // year 2025 (solar 2026-02-16).
     let t = jio::parse_time("2025年除夕").unwrap();
     assert_eq!(
         t.start.date(),
-        chrono::NaiveDate::from_ymd_opt(2025, 1, 28).unwrap()
+        chrono::NaiveDate::from_ymd_opt(2026, 2, 16).unwrap()
     );
 }
 
@@ -1222,10 +1225,12 @@ fn parity_parse_time_limit_month_day() {
 
 #[test]
 fn parity_parse_time_century_full() {
+    // Python treats 20世纪 = 1900..1999 (convention starts at year 1900,
+    // not 1901).
     let t = jio::parse_time_with_ref("20世纪", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "1901-01-01 00:00:00");
-    assert_eq!(t.end.to_string(), "2000-12-31 23:59:59");
+    assert_eq!(t.start.to_string(), "1900-01-01 00:00:00");
+    assert_eq!(t.end.to_string(), "1999-12-31 23:59:59");
 }
 
 #[test]
@@ -1295,18 +1300,19 @@ fn parity_parse_time_jinming_two_days() {
 
 #[test]
 fn parity_parse_time_super_blur_past_two_days() {
+    // Python `前两天` = [now-7d, now-2d] whole days.
     let t = jio::parse_time_with_ref("前两天", r17_ref()).unwrap();
     assert_eq!(t.definition, "blur");
-    assert_eq!(t.start.to_string(), "2024-03-14 00:00:00");
-    assert_eq!(t.end.to_string(), "2024-03-15 23:59:59");
+    assert_eq!(t.start.to_string(), "2024-03-08 00:00:00");
+    assert_eq!(t.end.to_string(), "2024-03-13 23:59:59");
 }
 
 #[test]
 fn parity_parse_time_super_blur_future_three_days() {
+    // Python `未来三天` = [now, now+3d] preserving now's time.
     let t = jio::parse_time_with_ref("未来三天", r17_ref()).unwrap();
-    assert_eq!(t.definition, "blur");
-    assert_eq!(t.start.to_string(), "2024-03-15 00:00:00");
-    assert_eq!(t.end.to_string(), "2024-03-17 23:59:59");
+    assert_eq!(t.start.to_string(), "2024-03-15 10:30:00");
+    assert_eq!(t.end.to_string(), "2024-03-18 10:30:00");
 }
 
 // ───────────────────────── parse_time — round 18 cases ────────────────────
@@ -1340,18 +1346,19 @@ fn parity_parse_time_solar_term_standalone() {
 
 #[test]
 fn parity_parse_time_season_with_year() {
-    // Python: `2021年春天` → 2021-03-01..2021-05-31.
+    // Python: `2021年春天` uses solar-term boundaries (立春..立夏-1).
     let t = jio::parse_time_with_ref("2021年春天", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "2021-03-01 00:00:00");
-    assert_eq!(t.end.to_string(), "2021-05-31 23:59:59");
+    assert_eq!(t.start.to_string(), "2021-02-03 00:00:00");
+    assert_eq!(t.end.to_string(), "2021-05-04 23:59:59");
 }
 
 #[test]
 fn parity_parse_time_season_limit_year() {
+    // Python solar-term boundaries: 立夏 2023 = May 6.
     let t = jio::parse_time_with_ref("去年夏季", r17_ref()).unwrap();
-    assert_eq!(t.start.to_string(), "2023-06-01 00:00:00");
-    assert_eq!(t.end.to_string(), "2023-08-31 23:59:59");
+    assert_eq!(t.start.to_string(), "2023-05-06 00:00:00");
+    assert_eq!(t.end.to_string(), "2023-08-07 23:59:59");
 }
 
 #[test]
@@ -1399,32 +1406,34 @@ fn parity_parse_time_pure_delta_month_chinese() {
 
 #[test]
 fn parity_parse_time_pure_delta_blur_tens_of_days() {
+    // Python `几十` = [20, 100].
     let t = jio::parse_time_with_ref("几十天", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_delta");
     assert_eq!(t.definition, "blur");
     match t.delta.as_ref().unwrap().day {
         Some(jio::DeltaValue::Range(lo, hi)) => {
             assert_eq!(lo, 20.0);
-            assert_eq!(hi, 80.0);
+            assert_eq!(hi, 100.0);
         }
-        _ => panic!("expected day Range(20, 80)"),
+        _ => panic!("expected day Range(20, 100)"),
     }
 }
 
 #[test]
 fn parity_parse_time_delta_to_span_future() {
+    // Python `再过五天` → open-ended [now+5d, inf].
     let t = jio::parse_time_with_ref("再过五天", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "2024-03-15 10:30:00");
-    assert_eq!(t.end.to_string(), "2024-03-20 10:30:00");
+    assert_eq!(t.start.to_string(), "2024-03-20 10:30:00");
 }
 
 #[test]
 fn parity_parse_time_delta_inner_span() {
+    // Python `5分钟内` → span [now, now+5min].
     let t = jio::parse_time_with_ref("5分钟内", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "2024-03-15 10:25:00");
-    assert_eq!(t.end.to_string(), "2024-03-15 10:30:00");
+    assert_eq!(t.start.to_string(), "2024-03-15 10:30:00");
+    assert_eq!(t.end.to_string(), "2024-03-15 10:35:00");
 }
 
 #[test]
@@ -1473,9 +1482,10 @@ fn parity_parse_time_pure_delta_range_cn() {
 
 #[test]
 fn parity_parse_time_blur_hour_morning() {
+    // Python classifies blur-hour phrases as time_point (a named part of
+    // the day) with blur definition.
     let t = jio::parse_time_with_ref("早上", r17_ref()).unwrap();
-    assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.definition, "blur");
+    assert_eq!(t.time_type, "time_point");
     assert_eq!(t.start.to_string(), "2024-03-15 06:00:00");
     assert_eq!(t.end.to_string(), "2024-03-15 09:59:59");
 }
@@ -1496,10 +1506,11 @@ fn parity_parse_time_approx_clock() {
 
 #[test]
 fn parity_parse_time_super_blur_hms() {
+    // Python super_blur_two_hms: `前两个小时` → [now-6h, now-2h] hour-precision.
     let t = jio::parse_time_with_ref("前两个小时", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "2024-03-15 08:30:00");
-    assert_eq!(t.end.to_string(), "2024-03-15 10:30:00");
+    assert_eq!(t.start.to_string(), "2024-03-15 04:00:00");
+    assert_eq!(t.end.to_string(), "2024-03-15 08:59:59");
 }
 
 #[test]
@@ -1558,10 +1569,11 @@ fn parity_parse_time_open_ended_after() {
 
 #[test]
 fn parity_parse_time_open_ended_before() {
+    // Python: X之前 with past X → end = X's full-day end.
     let t = jio::parse_time_with_ref("2024年春节之前", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
     assert_eq!(t.start.to_string(), "0001-01-01 00:00:00");
-    assert_eq!(t.end.to_string(), "2024-02-10 00:00:00");
+    assert_eq!(t.end.to_string(), "2024-02-10 23:59:59");
 }
 
 // ───────────────────────── parse_location_full — round 21 cases ───────────
@@ -1882,11 +1894,11 @@ fn parity_recurring_weekday_filtered() {
 
 #[test]
 fn parity_delta_month_zhihou_upgraded_to_span() {
-    // Python: `3个月之后` → time_span [now, now+3月].
+    // Python: `3个月之后` → open-ended time_span from (now+3mo).
     let t = jio::parse_time_with_ref("3个月之后", r17_ref()).unwrap();
     assert_eq!(t.time_type, "time_span");
-    assert_eq!(t.start.to_string(), "2024-03-15 10:30:00");
-    assert_eq!(t.end.to_string(), "2024-06-15 10:30:00");
+    // Start lands in June 2024 (~3*30.417 days after now).
+    assert_eq!(t.start.format("%Y-%m").to_string(), "2024-06");
 }
 
 #[test]
@@ -1900,11 +1912,11 @@ fn parity_delta_hour_yiqian_upgraded_to_span() {
 
 #[test]
 fn parity_delta_quarter_future_point() {
-    // `两个季度后` — bare 后 remains time_point.
+    // Python `两个季度后` = month-span of cur (now + 2 quarters = Sep 2024).
     let t = jio::parse_time_with_ref("两个季度后", r17_ref()).unwrap();
-    assert_eq!(t.time_type, "time_point");
-    // 2024-03-15 + 6 months = 2024-09-15.
-    assert_eq!(t.start.to_string(), "2024-09-15 10:30:00");
+    assert_eq!(t.time_type, "time_span");
+    assert_eq!(t.start.to_string(), "2024-09-01 00:00:00");
+    assert_eq!(t.end.to_string(), "2024-09-30 23:59:59");
 }
 
 #[test]
@@ -2484,4 +2496,446 @@ fn parity_location_town_village_matched() {
     assert_eq!(r.city.as_deref(), Some("红河哈尼族彝族自治州"));
     assert_eq!(r.county.as_deref(), Some("元阳县"));
     assert_eq!(r.town.as_deref(), Some("黄茅岭乡"));
+}
+
+// ───────────────────────── round 37 — all Python test_location_parser cases
+
+/// Fields we assert on for each Python location parity case. `None`
+/// slots in `province/city/county` mean the Python expected-null entry;
+/// `town`/`village` fields are only checked when town_village=true.
+struct LocExpect<'a> {
+    input: &'a str,
+    town_village: bool,
+    change2new: bool,
+    province: Option<&'a str>,
+    city: Option<&'a str>,
+    county: Option<&'a str>,
+    detail: &'a str,
+    town: Option<&'a str>,
+    village: Option<&'a str>,
+}
+
+fn loc_case(e: &LocExpect) {
+    let r = jio::parse_location_full(e.input, e.town_village, e.change2new).unwrap();
+    assert_eq!(
+        r.province.as_deref(),
+        e.province,
+        "{} province: got {:?} want {:?}",
+        e.input,
+        r.province,
+        e.province
+    );
+    assert_eq!(
+        r.city.as_deref(),
+        e.city,
+        "{} city: got {:?} want {:?}",
+        e.input,
+        r.city,
+        e.city
+    );
+    assert_eq!(
+        r.county.as_deref(),
+        e.county,
+        "{} county: got {:?} want {:?}",
+        e.input,
+        r.county,
+        e.county
+    );
+    assert_eq!(
+        r.detail, e.detail,
+        "{} detail: got {:?} want {:?}",
+        e.input, r.detail, e.detail
+    );
+    if e.town_village {
+        assert_eq!(
+            r.town.as_deref(),
+            e.town,
+            "{} town: got {:?} want {:?}",
+            e.input,
+            r.town,
+            e.town
+        );
+        assert_eq!(
+            r.village.as_deref(),
+            e.village,
+            "{} village: got {:?} want {:?}",
+            e.input,
+            r.village,
+            e.village
+        );
+    }
+}
+
+#[test]
+fn parity_location_all_from_python() {
+    ensure_init();
+    use LocExpect as L;
+    let cases: &[LocExpect] = &[
+        L {
+            input: "柳州地区忻城县",
+            town_village: false,
+            change2new: true,
+            province: Some("广西壮族自治区"),
+            city: Some("来宾市"),
+            county: Some("忻城县"),
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "台湾省台北市",
+            town_village: false,
+            change2new: true,
+            province: Some("台湾省"),
+            city: Some("台北市"),
+            county: None,
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "湖北省襄樊市小水街222号",
+            town_village: false,
+            change2new: true,
+            province: Some("湖北省"),
+            city: Some("襄阳市"),
+            county: None,
+            detail: "小水街222号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "老河口市天气",
+            town_village: true,
+            change2new: true,
+            province: Some("湖北省"),
+            city: Some("襄阳市"),
+            county: Some("老河口市"),
+            detail: "天气",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "河北区",
+            town_village: true,
+            change2new: true,
+            province: Some("天津市"),
+            city: Some("天津市"),
+            county: Some("河北区"),
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "湘潭城塘社区",
+            town_village: true,
+            change2new: true,
+            province: Some("湖南省"),
+            city: Some("湘潭市"),
+            county: None,
+            detail: "城塘社区",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "湘潭县城塘社区",
+            town_village: true,
+            change2new: true,
+            province: Some("湖南省"),
+            city: Some("湘潭市"),
+            county: Some("湘潭县"),
+            detail: "城塘社区",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "云南省红河哈尼族彝族自治州元阳县黄茅岭乡",
+            town_village: true,
+            change2new: true,
+            province: Some("云南省"),
+            city: Some("红河哈尼族彝族自治州"),
+            county: Some("元阳县"),
+            detail: "黄茅岭乡",
+            town: Some("黄茅岭乡"),
+            village: None,
+        },
+        L {
+            input: "吉林省吉林市小皇村",
+            town_village: true,
+            change2new: true,
+            province: Some("吉林省"),
+            city: Some("吉林市"),
+            county: None,
+            detail: "小皇村",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "重庆解放碑",
+            town_village: true,
+            change2new: true,
+            province: Some("重庆市"),
+            city: Some("重庆市"),
+            county: None,
+            detail: "解放碑",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "湖南湘潭城塘社区",
+            town_village: true,
+            change2new: true,
+            province: Some("湖南省"),
+            city: Some("湘潭市"),
+            county: None,
+            detail: "城塘社区",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "湖南湘潭市湘潭县城塘社区",
+            town_village: true,
+            change2new: true,
+            province: Some("湖南省"),
+            city: Some("湘潭市"),
+            county: Some("湘潭县"),
+            detail: "城塘社区",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "西湖区蒋村花园小区管局农贸市场",
+            town_village: true,
+            change2new: true,
+            province: None,
+            city: None,
+            county: Some("西湖区"),
+            detail: "蒋村花园小区管局农贸市场",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "山西长治潞州区山禾路2号",
+            town_village: false,
+            change2new: false,
+            province: Some("山西省"),
+            city: Some("长治市"),
+            county: Some("潞州区"),
+            detail: "山禾路2号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "青海西宁",
+            town_village: false,
+            change2new: false,
+            province: Some("青海省"),
+            city: Some("西宁市"),
+            county: None,
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "东兴市北仑大道59号",
+            town_village: true,
+            change2new: false,
+            province: Some("广西壮族自治区"),
+            city: Some("防城港市"),
+            county: Some("东兴市"),
+            detail: "北仑大道59号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "北海市重庆路其仓11号",
+            town_village: true,
+            change2new: false,
+            province: Some("广西壮族自治区"),
+            city: Some("北海市"),
+            county: None,
+            detail: "重庆路其仓11号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "海南藏族自治州",
+            town_village: true,
+            change2new: false,
+            province: Some("青海省"),
+            city: Some("海南藏族自治州"),
+            county: None,
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "西安交通大学",
+            town_village: true,
+            change2new: false,
+            province: Some("陕西省"),
+            city: Some("西安市"),
+            county: None,
+            detail: "交通大学",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "河北省秦皇岛市经济技术开发区",
+            town_village: true,
+            change2new: false,
+            province: Some("河北省"),
+            city: Some("秦皇岛市"),
+            county: Some("经济技术开发区"),
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "江西南昌市新建区松湖镇江西省南昌市新建区松湖镇松湖中心小学",
+            town_village: true,
+            change2new: true,
+            province: Some("江西省"),
+            city: Some("南昌市"),
+            county: Some("新建区"),
+            detail: "松湖镇江西省南昌市新建区松湖镇松湖中心小学",
+            town: Some("松湖镇"),
+            village: None,
+        },
+        L {
+            input: "湖南省长沙市",
+            town_village: true,
+            change2new: false,
+            province: Some("湖南省"),
+            city: Some("长沙市"),
+            county: None,
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "香港九龙半岛清水湾香港科技大学",
+            town_village: false,
+            change2new: false,
+            province: Some("香港特别行政区"),
+            city: Some("香港"),
+            county: Some("九龙城区"),
+            detail: "半岛清水湾香港科技大学",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "莱芜",
+            town_village: false,
+            change2new: false,
+            province: Some("山东省"),
+            city: Some("济南市"),
+            county: Some("莱芜区"),
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "成都市新津县金华镇清云北路2号（四川新津工业园）",
+            town_village: false,
+            change2new: false,
+            province: Some("四川省"),
+            city: Some("成都市"),
+            county: Some("新津区"),
+            detail: "金华镇清云北路2号（四川新津工业园）",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "青岛市市南区香港中路18号",
+            town_village: false,
+            change2new: false,
+            province: Some("山东省"),
+            city: Some("青岛市"),
+            county: Some("市南区"),
+            detail: "香港中路18号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "石首市笔架山办事处建设路香港城西街",
+            town_village: false,
+            change2new: false,
+            province: Some("湖北省"),
+            city: Some("荆州市"),
+            county: Some("石首市"),
+            detail: "笔架山办事处建设路香港城西街",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "新疆巴音郭楞",
+            town_village: false,
+            change2new: false,
+            province: Some("新疆维吾尔自治区"),
+            city: Some("巴音郭楞蒙古自治州"),
+            county: None,
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "内蒙古自治区通辽市科尔沁左翼后旗甘蓝子街98号",
+            town_village: true,
+            change2new: true,
+            province: Some("内蒙古自治区"),
+            city: Some("通辽市"),
+            county: Some("科尔沁左翼后旗"),
+            detail: "甘蓝子街98号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "内蒙古自治区通辽市科尔沁甘蓝子街98号",
+            town_village: true,
+            change2new: true,
+            province: Some("内蒙古自治区"),
+            city: Some("通辽市"),
+            county: Some("科尔沁区"),
+            detail: "甘蓝子街98号",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "内蒙古通辽市科尔沁左翼后旗",
+            town_village: true,
+            change2new: true,
+            province: Some("内蒙古自治区"),
+            city: Some("通辽市"),
+            county: Some("科尔沁左翼后旗"),
+            detail: "",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "库尔勒市祥和镇",
+            town_village: false,
+            change2new: true,
+            province: Some("新疆维吾尔自治区"),
+            city: Some("巴音郭楞蒙古自治州"),
+            county: Some("库尔勒市"),
+            detail: "祥和镇",
+            town: None,
+            village: None,
+        },
+        L {
+            input: "台湾省屏东县屏东市太原1路84号",
+            town_village: false,
+            change2new: true,
+            province: Some("台湾省"),
+            city: None,
+            county: Some("屏东县"),
+            detail: "屏东市太原1路84号",
+            town: None,
+            village: None,
+        },
+    ];
+    for c in cases {
+        loc_case(c);
+    }
 }

@@ -49,10 +49,16 @@ static TOPIC_PROMINENCE: OnceCell<Option<TopicProminence>> = OnceCell::new();
 ///
 /// `aliases` carries the short-form nickname (if any) for each admin name:
 /// `"广东省" → "广东"`, `"上海市" → "上海"`. Used by `location_parser`.
+///
+/// `entries` preserves every (code, prov, city, county) row from the
+/// source file. Some admin codes (e.g. Hong Kong's 810000) are shared
+/// across multiple districts, so `codes` — which dedupes by code — is
+/// lossy. `location_parser` iterates `entries` to see every district.
 #[derive(Debug)]
 pub struct ChinaLocation {
     pub codes: FxHashMap<String, (String, Option<String>, Option<String>)>,
     pub aliases: FxHashMap<String, String>,
+    pub entries: Vec<(String, String, Option<String>, Option<String>)>,
 }
 
 /// World location entry — `(continent, country, capital, cities)`.
@@ -540,6 +546,7 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
     let mut codes: FxHashMap<String, (String, Option<String>, Option<String>)> =
         FxHashMap::default();
     let mut aliases: FxHashMap<String, String> = FxHashMap::default();
+    let mut entries: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
     let mut cur_prov: Option<String> = None;
     let mut cur_city: Option<String> = None;
 
@@ -562,7 +569,11 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
                 cur_prov = Some(name.clone());
                 cur_city = None;
                 if parts.len() >= 2 {
-                    codes.insert(parts[1].to_string(), (name.clone(), None, None));
+                    let code = parts[1].to_string();
+                    codes
+                        .entry(code.clone())
+                        .or_insert_with(|| (name.clone(), None, None));
+                    entries.push((code, name.clone(), None, None));
                     if parts.len() >= 3 && !parts[2].is_empty() {
                         aliases.insert(name, parts[2].to_string());
                     }
@@ -574,10 +585,11 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
                 cur_city = Some(name.clone());
                 if parts.len() >= 2 {
                     if let Some(ref prov) = cur_prov {
-                        codes.insert(
-                            parts[1].to_string(),
-                            (prov.clone(), Some(name.clone()), None),
-                        );
+                        let code = parts[1].to_string();
+                        codes.entry(code.clone()).or_insert_with(|| {
+                            (prov.clone(), Some(name.clone()), None)
+                        });
+                        entries.push((code, prov.clone(), Some(name.clone()), None));
                     }
                     if parts.len() >= 3 && !parts[2].is_empty() {
                         aliases.insert(name, parts[2].to_string());
@@ -589,10 +601,11 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
                 let name = parts[0].to_string();
                 if parts.len() >= 2 {
                     if let Some(ref prov) = cur_prov {
-                        codes.insert(
-                            parts[1].to_string(),
-                            (prov.clone(), cur_city.clone(), Some(name.clone())),
-                        );
+                        let code = parts[1].to_string();
+                        codes.entry(code.clone()).or_insert_with(|| {
+                            (prov.clone(), cur_city.clone(), Some(name.clone()))
+                        });
+                        entries.push((code, prov.clone(), cur_city.clone(), Some(name.clone())));
                     }
                     if parts.len() >= 3 && !parts[2].is_empty() {
                         aliases.insert(name, parts[2].to_string());
@@ -603,7 +616,11 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
         }
     }
 
-    ChinaLocation { codes, aliases }
+    ChinaLocation {
+        codes,
+        aliases,
+        entries,
+    }
 }
 
 /// Pull `[pinyin]` tokens out of a meaning/gloss free-text string.

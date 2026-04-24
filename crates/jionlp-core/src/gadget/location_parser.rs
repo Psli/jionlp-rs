@@ -135,11 +135,9 @@ fn index() -> Result<&'static AdminIndex> {
 }
 
 fn build_index() -> Result<AdminIndex> {
-    use crate::gadget::location_recognizer::classify_level_pub;
     let cl = dict::china_location()?;
     let changes = dict::china_location_changes().ok().unwrap_or(&[]);
 
-    // Group codes by (prov, city) for quick lookup when building admin entries.
     let mut entries: Vec<AdminEntry> = Vec::new();
 
     // Municipalities (city = province name) to skip when building
@@ -148,44 +146,66 @@ fn build_index() -> Result<AdminIndex> {
         .into_iter()
         .collect();
 
-    // For each code in dict, classify & emit entries similarly to Python's
-    // `_mapping`. We emit province-level entry for non-municipal provinces,
-    // city-level entries, and county-level entries.
-    for (code, (prov, city, county)) in cl.codes.iter() {
-        let level = classify_level_pub(code);
-        let prov_alias = cl.aliases.get(prov).cloned();
-        let city_alias = city.as_ref().and_then(|c| cl.aliases.get(c).cloned());
-        let county_alias = county.as_ref().and_then(|c| cl.aliases.get(c).cloned());
+    // A level's alias column can be a `/`-separated list (e.g.
+    // 巴音郭楞蒙古自治州's alias is "巴州/巴音郭楞"). Split so each alias
+    // appears as its own candidate entry.
+    fn split_aliases(s: &Option<String>) -> Vec<Option<String>> {
+        match s {
+            None => vec![None],
+            Some(x) if x.is_empty() => vec![None],
+            Some(x) if x.contains('/') => x.split('/').map(|p| Some(p.to_string())).collect(),
+            Some(x) => vec![Some(x.clone())],
+        }
+    }
 
-        match level {
-            crate::gadget::location_recognizer::LocationLevel::Province => {
-                let is_muni = prov_alias
+    // Infer level from row shape (which columns are set) rather than the
+    // admin code — some codes (e.g. HK's 810000) are shared across an
+    // entire SAR, so code-based classification would erase every district.
+    for (code, prov, city, county) in cl.entries.iter() {
+        let prov_alias_raw = cl.aliases.get(prov).cloned();
+        let city_alias_raw = city.as_ref().and_then(|c| cl.aliases.get(c).cloned());
+        let county_alias_raw = county.as_ref().and_then(|c| cl.aliases.get(c).cloned());
+        let prov_aliases = split_aliases(&prov_alias_raw);
+        let city_aliases = split_aliases(&city_alias_raw);
+        let county_aliases = split_aliases(&county_alias_raw);
+
+        match (city.is_some(), county.is_some()) {
+            (false, false) => {
+                let is_muni = prov_alias_raw
                     .as_deref()
-                    .map(|a| municipalities.contains(a))
+                    .map(|a| {
+                        a.split('/').any(|p| municipalities.contains(p))
+                    })
                     .unwrap_or(false)
                     || municipalities
                         .iter()
                         .any(|m| prov.starts_with(*m) && prov.ends_with(['市', '区']));
                 if !is_muni {
-                    entries.push(AdminEntry {
-                        code: code.clone(),
-                        prov: (Some(prov.clone()), prov_alias.clone()),
-                        city: (None, None),
-                        county: (None, None),
-                        is_new: true,
-                    });
+                    for pa in &prov_aliases {
+                        entries.push(AdminEntry {
+                            code: code.clone(),
+                            prov: (Some(prov.clone()), pa.clone()),
+                            city: (None, None),
+                            county: (None, None),
+                            is_new: true,
+                        });
+                    }
                 }
             }
-            crate::gadget::location_recognizer::LocationLevel::City => {
-                entries.push(AdminEntry {
-                    code: code.clone(),
-                    prov: (Some(prov.clone()), prov_alias.clone()),
-                    city: (city.clone(), city_alias.clone()),
-                    county: (None, None),
-                    is_new: true,
-                });
+            (true, false) => {
+                for pa in &prov_aliases {
+                    for ca in &city_aliases {
+                        entries.push(AdminEntry {
+                            code: code.clone(),
+                            prov: (Some(prov.clone()), pa.clone()),
+                            city: (city.clone(), ca.clone()),
+                            county: (None, None),
+                            is_new: true,
+                        });
+                    }
+                }
             }
-            crate::gadget::location_recognizer::LocationLevel::County => {
+            (true, true) | (false, true) => {
                 // Normalize county: when it ends with 经济技术开发区, store
                 // the suffix only — mirrors Python's collision-prevention
                 // trick so `河北省秦皇岛市经济技术开发区` resolves to
@@ -197,13 +217,19 @@ fn build_index() -> Result<AdminIndex> {
                         c.clone()
                     }
                 });
-                entries.push(AdminEntry {
-                    code: code.clone(),
-                    prov: (Some(prov.clone()), prov_alias.clone()),
-                    city: (city.clone(), city_alias.clone()),
-                    county: (normalized_county, county_alias.clone()),
-                    is_new: true,
-                });
+                for pa in &prov_aliases {
+                    for ca in &city_aliases {
+                        for cty_a in &county_aliases {
+                            entries.push(AdminEntry {
+                                code: code.clone(),
+                                prov: (Some(prov.clone()), pa.clone()),
+                                city: (city.clone(), ca.clone()),
+                                county: (normalized_county.clone(), cty_a.clone()),
+                                is_new: true,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -339,23 +365,33 @@ fn get_candidates(idx: &AdminIndex, text: &str) -> Vec<ScoredCandidate> {
 }
 
 fn filter_candidates(mut candidates: Vec<ScoredCandidate>, _text: &str) -> Vec<ScoredCandidate> {
-    // Step 2.0 — drop entries where the same text offset matched a higher
-    // level's full-name AND a lower level's alias (e.g. 湖南省长沙市 →
-    // drop the 长沙县 alias match because 长沙市 full-name is at same offset).
+    // Step 2.0 — Python parity: if offsets have duplicates, find the most
+    // common offset; if its two items are (full, alias) in that order,
+    // drop the candidate. Three-way nested (e.g. 湘/湘潭/湘潭县 at offset 0)
+    // falls through because the first two flags are both 1.
     candidates.retain(|c| {
-        let mut seen: rustc_hash::FxHashMap<i64, Vec<i8>> = rustc_hash::FxHashMap::default();
-        for (pos, alias) in c.offsets.iter() {
-            if *pos >= 0 {
-                seen.entry(*pos).or_default().push(*alias);
-            }
+        let positive: Vec<(i64, i8)> = c
+            .offsets
+            .iter()
+            .filter(|x| x.0 >= 0)
+            .copied()
+            .collect();
+        let offset_set: rustc_hash::FxHashSet<i64> = positive.iter().map(|x| x.0).collect();
+        if offset_set.len() == positive.len() {
+            return true; // no duplicates
         }
-        for v in seen.values() {
-            if v.len() >= 2 && v.contains(&0) && v.contains(&1) {
-                // Same offset has a full-name AND an alias → reject.
-                return false;
-            }
+        let mut counts: rustc_hash::FxHashMap<i64, i32> = rustc_hash::FxHashMap::default();
+        for (p, _) in &positive {
+            *counts.entry(*p).or_insert(0) += 1;
         }
-        true
+        let most_common = counts.iter().max_by_key(|(_, c)| *c).map(|(k, _)| *k);
+        let Some(moff) = most_common else {
+            return true;
+        };
+        let dup: Vec<(i64, i8)> = positive.iter().filter(|x| x.0 == moff).copied().collect();
+        // Python: `the_same_offset_loc[0][1] == 0 and the_same_offset_loc[1][1] == 1`.
+        // Only drop when the FIRST two entries at that offset are (full, alias).
+        !(dup.len() >= 2 && dup[0].1 == 0 && dup[1].1 == 1)
     });
     if candidates.is_empty() {
         return candidates;
@@ -404,7 +440,9 @@ fn filter_candidates(mut candidates: Vec<ScoredCandidate>, _text: &str) -> Vec<S
         }
         let o = &c.offsets;
         if o.iter().all(|x| x.0 >= 0) {
-            o[0].0 < o[1].0 && o[1].0 < o[2].0
+            // `<=` allows nested aliases — e.g. `湘潭县` → prov=湘 @0,
+            // city=湘潭 @0, county=湘潭县 @0.
+            o[0].0 <= o[1].0 && o[1].0 <= o[2].0
         } else {
             true
         }
@@ -468,28 +506,48 @@ fn filter_candidates(mut candidates: Vec<ScoredCandidate>, _text: &str) -> Vec<S
 }
 
 fn county_duplicate_list(candidates: &[ScoredCandidate]) -> Vec<String> {
-    // Collect county-level matched-name per candidate (using alias_flag to
-    // pick full vs alias). Only keep names appearing more than once.
-    let mut names: Vec<String> = Vec::new();
-    for c in candidates {
-        let (cf, ca) = (&c.entry.county.0, &c.entry.county.1);
-        let alias_flag = c.offsets[2].1;
-        let name = match alias_flag {
-            0 => cf.clone(),
-            1 => ca.clone(),
-            _ => continue,
-        };
-        if let Some(n) = name {
-            names.push(n);
+    // Per-candidate county name (full or alias per offsets[2].1).
+    let per_candidate: Vec<Option<String>> = candidates
+        .iter()
+        .map(|c| {
+            let (cf, ca) = (&c.entry.county.0, &c.entry.county.1);
+            match c.offsets[2].1 {
+                0 => cf.clone(),
+                1 => ca.clone(),
+                _ => None,
+            }
+        })
+        .collect();
+
+    let names: Vec<String> = per_candidate.iter().flatten().cloned().collect();
+
+    // Python exception: if all candidates sharing a county name also share
+    // the same city, drop it from the dup list — this covers 库尔勒市
+    // appearing via both 巴州 and 巴音郭楞 aliases of the same 巴音郭楞蒙古
+    // 自治州, where it's not really a collision.
+    let mut exception: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    // Python iterates `county_dup_list` (names per candidate), so an empty
+    // sub-list can't happen here. Use the set of distinct names.
+    let distinct: rustc_hash::FxHashSet<String> = names.iter().cloned().collect();
+    for dup in &distinct {
+        // Python bug-for-bug: `city_dup_list` is built from ALL candidates,
+        // not only those matching `dup`. Keep the same semantics.
+        let city_set: rustc_hash::FxHashSet<Option<String>> = candidates
+            .iter()
+            .map(|c| c.entry.city.0.clone())
+            .collect();
+        if city_set.len() == 1 {
+            exception.insert(dup.clone());
         }
     }
+
     let mut counts: rustc_hash::FxHashMap<String, i32> = rustc_hash::FxHashMap::default();
     for n in &names {
         *counts.entry(n.clone()).or_insert(0) += 1;
     }
     counts
         .into_iter()
-        .filter(|(_, c)| *c > 1)
+        .filter(|(n, c)| *c > 1 && !exception.contains(n))
         .map(|(n, _)| n)
         .collect()
 }
@@ -529,10 +587,10 @@ fn assemble_final(
             _ => None,
         };
         let len = name.as_ref().map(|s| s.len()).unwrap_or(0);
-        let candidate_idx = off.0 as usize + len;
-        if candidate_idx > detail_idx {
-            detail_idx = candidate_idx;
-        }
+        // Python overwrites detail_idx at each matched level, so the
+        // deepest-matched level always wins — even if an earlier level
+        // matched a later (second-occurrence) position in the text.
+        detail_idx = off.0 as usize + len;
         // Populate levels <= i when not in county_dup.
         let name_str = name.unwrap_or_default();
         if !county_dup.contains(&name_str) {
