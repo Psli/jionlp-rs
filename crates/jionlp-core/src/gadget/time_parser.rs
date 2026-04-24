@@ -1341,12 +1341,19 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
     // used later for implicit-year ranges like "3月5日到8日" (no year).
     let _ = now;
 
-    // Span end: when the right side carried an explicit hour (e.g. "16时"),
-    // Python returns the hour point (16:00:00) rather than the inclusive
-    // end-of-hour (16:59:59). If the rhs is a time_point whose start has
-    // a non-midnight clock, use `b.start` instead of `b.end`.
+    // Span end convention (Python-matching):
+    //   - rhs is a point at hour precision (gap ~ 1 hour): anchor to
+    //     start so `X~16时` → end = 16:00:00.
+    //   - rhs is a point at minute precision (gap ≤ 59s): use b.end
+    //     (`12点半` → 12:30:59).
+    //   - Otherwise (midnight start or time_span): use b.end.
     let end = if b.time_type == "time_point" && b.start.time() != chrono::NaiveTime::MIN {
-        b.start
+        let gap = (b.end - b.start).num_seconds();
+        if gap >= 3000 {
+            b.start
+        } else {
+            b.end
+        }
     } else {
         b.end
     };
@@ -1853,7 +1860,22 @@ fn try_clock_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
             };
 
             let start = base_day.and_time(left_clock);
-            let end = base_day.and_time(right_clock);
+            let mut end = base_day.and_time(right_clock);
+            // Minute-precision right → extend end to :59s so `9~12点半`
+            // → end = 12:30:59 rather than 12:30:00.
+            let right_has_minute = right.contains('分')
+                || right.contains(':')
+                || right.contains("点半")
+                || right.contains("时半")
+                || right.contains("一刻")
+                || right.contains("二刻")
+                || right.contains("两刻")
+                || right.contains("三刻");
+            if right_has_minute && !right.contains('秒') {
+                if let Some(e) = end.with_second(59) {
+                    end = e;
+                }
+            }
             if end < start {
                 return None;
             }
