@@ -1316,14 +1316,13 @@ fn try_date_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         t
     } else if let Some(t) = try_relative_day(right, now) {
         t
-    } else if let Some(t) = try_fixed_holiday(right, now) {
-        t
     } else if let Some(t) = try_limit_year_festival(right, now) {
         t
     } else {
-        // Festival name inherited from LHS (e.g. `去年春节到元宵节` →
-        // RHS is `元宵节` without year). Construct a pseudo-now anchored
-        // at LHS's year so year-inheriting parsers pick up the right year.
+        // Festival name on RHS (e.g. `去年春节到元宵节` → RHS is
+        // `元宵节` with no year). Use a pseudo-now anchored at LHS's
+        // year so year-inheriting parsers pick up the inherited year
+        // rather than the outer caller's `now`.
         let lhs_now = NaiveDate::from_ymd_opt(a.start.year(), 1, 1)
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .unwrap_or(now);
