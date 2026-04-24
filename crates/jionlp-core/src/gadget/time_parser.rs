@@ -781,9 +781,19 @@ fn apply_optional_clock(start: NaiveDateTime, end: NaiveDateTime, tail: &str) ->
     let dt = start.date().and_time(clock);
     // Precision-aware end: seconds → same instant; minute → :59s;
     // hour → :59m:59s. Run on the normalized tail so `：` counts.
+    // Minute-precision detectors: explicit `分`, `半/一刻/二刻/三刻/两刻`,
+    // or any single `:` (double `:` means seconds present already).
+    let has_minute = tail_clean.contains('分')
+        || tail_clean.contains(':')
+        || tail_clean.contains("点半")
+        || tail_clean.contains("时半")
+        || tail_clean.contains("一刻")
+        || tail_clean.contains("二刻")
+        || tail_clean.contains("两刻")
+        || tail_clean.contains("三刻");
     let end_dt = if tail_clean.contains('秒') || tail_clean.matches(':').count() >= 2 {
         dt
-    } else if tail_clean.contains('分') || tail_clean.contains(':') {
+    } else if has_minute {
         dt.with_second(59).unwrap_or(dt)
     } else {
         dt.with_minute(59)
@@ -1035,31 +1045,58 @@ fn try_fixed_holiday(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
         .iter()
         .filter(|(name, _, _)| rest.starts_with(name))
         .max_by_key(|(name, _, _)| name.chars().count())
-        .map(|&(n, m, d)| (n, m, d));
+        .map(|&(n, m, d)| (n, year, m, d));
     let lunar = LUNAR_HOLIDAYS
         .iter()
         .filter(|(name, _)| rest.starts_with(name))
         .max_by_key(|(name, _)| name.chars().count())
-        .and_then(|&(name, holiday)| lunar_holiday_date(year, holiday).map(|(m, d)| (name, m, d)));
+        .and_then(|&(name, holiday)| {
+            // For 除夕 the solar date often rolls into year+1 (late-Jan /
+            // Feb), so include the resolved year instead of assuming the
+            // input year.
+            let solar = lunar_holiday_full(year, holiday)?;
+            Some((name, solar.year(), solar.month(), solar.day()))
+        });
     let nth = NTH_WEEKDAY_HOLIDAYS
         .iter()
         .filter(|(name, _, _, _)| rest.starts_with(name))
         .max_by_key(|(name, _, _, _)| name.chars().count())
         .and_then(|&(name, month, wday, nth)| {
-            nth_weekday_of_month(year, month, wday, nth).map(|d| (name, month, d.day()))
+            nth_weekday_of_month(year, month, wday, nth).map(|d| (name, year, month, d.day()))
         });
 
     // Pick whichever matched with the longest prefix.
-    let cands: [Option<(&str, u32, u32)>; 3] = [fixed, lunar, nth];
-    let (matched_name, month, day) = cands
+    let cands: [Option<(&str, i32, u32, u32)>; 3] = [fixed, lunar, nth];
+    let (matched_name, ryear, month, day) = cands
         .iter()
         .flatten()
-        .max_by_key(|(name, _, _)| name.chars().count())
+        .max_by_key(|(name, _, _, _)| name.chars().count())
         .copied()?;
 
     let tail = rest[matched_name.len()..].trim();
-    let (start, end) = date_range(year, Some(month), Some(day))?;
+    let (start, end) = date_range(ryear, Some(month), Some(day))?;
     apply_optional_clock(start, end, tail)
+}
+
+/// Same as `lunar_holiday_date` but returns the full NaiveDate so callers
+/// can see the resolved year (which differs from the input year for
+/// 除夕 and early-Feb Chinese New Year).
+fn lunar_holiday_full(year: i32, holiday: LunarHoliday) -> Option<NaiveDate> {
+    use crate::gadget::lunar_solar::lunar_to_solar;
+    let (lunar_month, day_strategy) = match holiday {
+        LunarHoliday::ChineseNewYear => (1u32, HolidayDay::Fixed(1)),
+        LunarHoliday::LanternFestival => (1, HolidayDay::Fixed(15)),
+        LunarHoliday::DragonBoat => (5, HolidayDay::Fixed(5)),
+        LunarHoliday::QiXi => (7, HolidayDay::Fixed(7)),
+        LunarHoliday::MidAutumn => (8, HolidayDay::Fixed(15)),
+        LunarHoliday::ChongYang => (9, HolidayDay::Fixed(9)),
+        LunarHoliday::NewYearEve => {
+            let last_day = lunar_month_length(year, 12)?;
+            return lunar_to_solar(year, 12, last_day, false);
+        }
+    };
+    let HolidayDay::Fixed(day) = day_strategy;
+    lunar_to_solar(year, lunar_month, day, false)
 }
 
 // ───────────────────────── lunar-holiday table ──────────────────────────────
@@ -1094,6 +1131,7 @@ const LUNAR_HOLIDAYS: &[(&str, LunarHoliday)] = &[
     ("重阳节", LunarHoliday::ChongYang),
     ("重阳", LunarHoliday::ChongYang),
     ("除夕", LunarHoliday::NewYearEve),
+    ("大年三十", LunarHoliday::NewYearEve),
 ];
 
 /// Look up the Gregorian (month, day) for a given lunar holiday in a given
@@ -1111,16 +1149,14 @@ fn lunar_holiday_date(year: i32, holiday: LunarHoliday) -> Option<(u32, u32)> {
         LunarHoliday::QiXi => (7, HolidayDay::Fixed(7)),
         LunarHoliday::MidAutumn => (8, HolidayDay::Fixed(15)),
         LunarHoliday::ChongYang => (9, HolidayDay::Fixed(9)),
-        // 除夕 = last day of previous lunar year's 12th month.
-        // Convention in Python jionlp: 除夕 of *year* is the day before the
-        // Gregorian New Year's Day for *year*. We interpret "2024 除夕" as
-        // "the lunar new year's eve that falls *in* 2024" — i.e. the day
-        // before 2024's Chinese New Year. That means decoding lunar 2023's
-        // last-day.
+        // 除夕 of *lunar year Y* = last day of lunar Y month 12. That
+        // solar date may be in solar year Y or Y+1 (typically Y+1 when
+        // Chinese New Year falls in late January / February).
+        // Python jionlp: `<Y>除夕` → lunar <Y> 12/N where N = last day.
+        // `2023年大年三十` → 2024-02-09 (lunar 2023-12-30).
         LunarHoliday::NewYearEve => {
-            let prev = year - 1;
-            let last_day = lunar_month_length(prev, 12)?;
-            let d = lunar_to_solar(prev, 12, last_day, false)?;
+            let last_day = lunar_month_length(year, 12)?;
+            let d = lunar_to_solar(year, 12, last_day, false)?;
             return Some((d.month(), d.day()));
         }
     };
@@ -6139,8 +6175,14 @@ mod tests {
 
     #[test]
     fn lunar_new_year_eve_2024() {
+        // Python convention: bare `除夕` with ref in year Y resolves to
+        // lunar Y's 12/N (last day). ref_now = 2024-03-15 → lunar 2024's
+        // last day = 2025-01-28. (Python also returns time_point.)
         let t = parse_time_with_ref("除夕", ref_now()).unwrap();
-        assert_eq!(t.start.date(), NaiveDate::from_ymd_opt(2024, 2, 9).unwrap());
+        assert_eq!(
+            t.start.date(),
+            NaiveDate::from_ymd_opt(2025, 1, 28).unwrap()
+        );
     }
 
     #[test]
