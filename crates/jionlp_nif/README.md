@@ -2,7 +2,7 @@
 
 Rustler NIF for [**jionlp-core**](../jionlp-core). This crate is not
 published to crates.io — it is built as a `cdylib` and loaded by the
-[`jionlp_ex`](https://github.com/Psli/jionlp_rs) Elixir package.
+[`jionlp_ex`](https://github.com/Psli/jionlp-rs) Elixir package.
 
 ## Consumers
 
@@ -13,7 +13,7 @@ published to crates.io — it is built as a `cdylib` and loaded by the
 
 ## Release flow
 
-Pushing a `jionlp_ex-v*` tag to the `Psli/jionlp_rs` repository triggers
+Pushing a `jionlp_ex-v*` tag to the `Psli/jionlp-rs` repository triggers
 `.github/workflows/release-nif.yml`, which cross-compiles 7 targets × 2
 NIF versions and uploads the tarballs to the corresponding GitHub
 Release. `rustler_precompiled` then fetches by URL.

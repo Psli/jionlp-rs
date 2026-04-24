@@ -14,7 +14,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["jionlp-rs contributors"]
 description = "Rust port of JioNLP — Chinese NLP preprocessing & parsing toolkit"
-repository = "https://github.com/Psli/jionlp_rs"
+repository = "https://github.com/Psli/jionlp-rs"
 readme = "README.md"
 rust-version = "1.85"
 
