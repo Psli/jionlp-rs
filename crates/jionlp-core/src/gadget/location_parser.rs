@@ -173,9 +173,7 @@ fn build_index() -> Result<AdminIndex> {
             (false, false) => {
                 let is_muni = prov_alias_raw
                     .as_deref()
-                    .map(|a| {
-                        a.split('/').any(|p| municipalities.contains(p))
-                    })
+                    .map(|a| a.split('/').any(|p| municipalities.contains(p)))
                     .unwrap_or(false)
                     || municipalities
                         .iter()
@@ -370,12 +368,7 @@ fn filter_candidates(mut candidates: Vec<ScoredCandidate>, _text: &str) -> Vec<S
     // drop the candidate. Three-way nested (e.g. 湘/湘潭/湘潭县 at offset 0)
     // falls through because the first two flags are both 1.
     candidates.retain(|c| {
-        let positive: Vec<(i64, i8)> = c
-            .offsets
-            .iter()
-            .filter(|x| x.0 >= 0)
-            .copied()
-            .collect();
+        let positive: Vec<(i64, i8)> = c.offsets.iter().filter(|x| x.0 >= 0).copied().collect();
         let offset_set: rustc_hash::FxHashSet<i64> = positive.iter().map(|x| x.0).collect();
         if offset_set.len() == positive.len() {
             return true; // no duplicates
@@ -532,10 +525,8 @@ fn county_duplicate_list(candidates: &[ScoredCandidate]) -> Vec<String> {
     for dup in &distinct {
         // Python bug-for-bug: `city_dup_list` is built from ALL candidates,
         // not only those matching `dup`. Keep the same semantics.
-        let city_set: rustc_hash::FxHashSet<Option<String>> = candidates
-            .iter()
-            .map(|c| c.entry.city.0.clone())
-            .collect();
+        let city_set: rustc_hash::FxHashSet<Option<String>> =
+            candidates.iter().map(|c| c.entry.city.0.clone()).collect();
         if city_set.len() == 1 {
             exception.insert(dup.clone());
         }

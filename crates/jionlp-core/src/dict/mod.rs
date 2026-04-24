@@ -586,9 +586,9 @@ fn parse_china_location_text(text: &str) -> ChinaLocation {
                 if parts.len() >= 2 {
                     if let Some(ref prov) = cur_prov {
                         let code = parts[1].to_string();
-                        codes.entry(code.clone()).or_insert_with(|| {
-                            (prov.clone(), Some(name.clone()), None)
-                        });
+                        codes
+                            .entry(code.clone())
+                            .or_insert_with(|| (prov.clone(), Some(name.clone()), None));
                         entries.push((code, prov.clone(), Some(name.clone()), None));
                     }
                     if parts.len() >= 3 && !parts[2].is_empty() {
