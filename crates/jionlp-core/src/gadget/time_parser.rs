@@ -743,7 +743,7 @@ static CLOCK: Lazy<Regex> = Lazy::new(|| {
     // Hour, optional minute (after `点`/`时`/`:`), optional seconds — accepts
     // both Chinese `N秒` and ISO-style `:SS` tail (e.g. `09:36:46`).
     Regex::new(
-        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|傍晚|夜里|夜间)?\s*(\d{1,2})\s*(?:[点时:](\d{1,2})?\s*(?:分)?\s*(?::(\d{1,2})|(\d{1,2})\s*秒)?)?",
+        r"^(凌晨|早[上晨]?|上午|中午|下午|午后|晚上|晚|傍晚|夜里|夜间|半夜)?\s*(\d{1,2})\s*(?:[点时:](\d{1,2})?\s*(?:分)?\s*(?::(\d{1,2})|(\d{1,2})\s*秒)?)?",
     )
     .unwrap()
 });
@@ -964,8 +964,20 @@ fn normalize_hour_by_period(hour: u32, period: Option<&str>) -> u32 {
             }
         }
         Some("中午") => hour, // 12:30 stays at 12:30
-        Some("下午") | Some("午后") | Some("晚上") | Some("傍晚") | Some("夜里") | Some("夜间") => {
+        Some("下午") | Some("午后") | Some("晚上") | Some("晚") | Some("傍晚") | Some("夜里")
+        | Some("夜间") => {
             if hour < 12 {
+                hour + 12
+            } else {
+                hour
+            }
+        }
+        // 半夜: hours 1-5 stay as-is (late-night early hours); 11, 12
+        // treat as PM-roll (半夜11点 = 23:00, 半夜12点 = 00:00).
+        Some("半夜") => {
+            if hour == 12 {
+                0
+            } else if hour >= 8 {
                 hour + 12
             } else {
                 hour
@@ -1017,26 +1029,36 @@ const NTH_WEEKDAY_HOLIDAYS: &[(&str, u32, u32, u32)] = &[
 ];
 
 fn try_fixed_holiday(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
+    // Strip an optional 农历/阴历 marker (`农历元宵` / `阴历端午`).
+    let text_stripped = text
+        .strip_prefix("农历")
+        .or_else(|| text.strip_prefix("阴历"))
+        .unwrap_or(text);
     // Strip an optional year prefix like "2024年" or "零三年" so
     // "2024年国庆节" / "零三年元宵节" works.
     let (year, rest) = {
         // Try ASCII-digit year first (2024年...).
         let ascii = YMD_CN
-            .captures(text)
+            .captures(text_stripped)
             .filter(|c| c.get(2).is_none())
             .and_then(|c| {
                 let y = parse_year(c.get(1)?.as_str())?;
                 Some((y, c.get(4).map(|m| m.as_str().trim()).unwrap_or("")))
             });
         let cn = YMD_CN_CHINESE
-            .captures(text)
+            .captures(text_stripped)
             .filter(|c| c.get(2).is_none())
             .and_then(|c| {
                 let y = parse_chinese_year_digits(c.get(1)?.as_str())?;
                 Some((y, c.get(4).map(|m| m.as_str().trim()).unwrap_or("")))
             });
-        ascii.or(cn).unwrap_or((now.date().year(), text))
+        ascii.or(cn).unwrap_or((now.date().year(), text_stripped))
     };
+    // After potentially stripping a year prefix, strip a nested 农历/阴历.
+    let rest = rest
+        .strip_prefix("农历")
+        .or_else(|| rest.strip_prefix("阴历"))
+        .unwrap_or(rest);
 
     // Match against the longest holiday name first to avoid "清明" stealing
     // priority from "清明节". Three sources: fixed-Gregorian, lunar, and
