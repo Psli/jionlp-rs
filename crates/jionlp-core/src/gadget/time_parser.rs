@@ -1842,9 +1842,15 @@ fn try_clock_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
             // side to NOT contain a 日/号 (that would be a date range), and
             // both sides must have a clock marker (点/时/:) to prevent
             // greedy digit-matching on year-month strings like "2024年3月".
-            if right.contains('日')
-                || right.contains('号')
-                || right.contains('年')
+            // Allow `次日/翌日/明日/第二天` day-cross markers on the
+            // right even though they contain `日/天`.
+            let right_has_day_cross = right.starts_with("次日")
+                || right.starts_with("次天")
+                || right.starts_with("翌日")
+                || right.starts_with("明日")
+                || right.starts_with("第二天");
+            if (!right_has_day_cross
+                && (right.contains('日') || right.contains('号') || right.contains('年')))
                 || left.contains('年')
             {
                 continue;
@@ -1858,15 +1864,37 @@ fn try_clock_range(text: &str, now: NaiveDateTime) -> Option<TimeInfo> {
             // If the right side doesn't carry its own period qualifier
             // (上午/下午/…) but the left side does, inherit the left's
             // qualifier. Otherwise parse the right side as-is.
-            let (right_period, _) = split_period(right);
+            // Strip 次日 / 次天 / 翌日 / 明日 / 第二天 prefix before
+            // clock parsing (already tracked for end-day shift above).
+            let right_clock_src = right
+                .strip_prefix("次日")
+                .or_else(|| right.strip_prefix("次天"))
+                .or_else(|| right.strip_prefix("翌日"))
+                .or_else(|| right.strip_prefix("明日"))
+                .or_else(|| right.strip_prefix("第二天"))
+                .unwrap_or(right)
+                .trim();
+            let (right_period, _) = split_period(right_clock_src);
             let (left_period, _) = split_period(left);
             let right_clock = match (right_period, left_period) {
-                (None, Some(lp)) => parse_clock(&format!("{}{}", lp, right))?,
-                _ => parse_clock(right)?,
+                (None, Some(lp)) => parse_clock(&format!("{}{}", lp, right_clock_src))?,
+                _ => parse_clock(right_clock_src)?,
             };
 
             let start = base_day.and_time(left_clock);
-            let mut end = base_day.and_time(right_clock);
+            // `次日` / `次天` / `翌日` / `明日` / `第二天` on the right
+            // means the range crosses midnight — shift end one day.
+            let right_cross_midnight = right.starts_with("次日")
+                || right.starts_with("次天")
+                || right.starts_with("翌日")
+                || right.starts_with("明日")
+                || right.starts_with("第二天");
+            let end_day = if right_cross_midnight {
+                base_day + Duration::days(1)
+            } else {
+                base_day
+            };
+            let mut end = end_day.and_time(right_clock);
             // Minute-precision right → extend end to :59s so `9~12点半`
             // → end = 12:30:59 rather than 12:30:00.
             let right_has_minute = right.contains('分')
